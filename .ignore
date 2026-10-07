@@ -1,0 +1,4 @@
+# ripgrep (and so agent Grep/Glob) skips these: three 855KB design HTML sheets with inlined assets flood every search.
+# Files stay on disk and in git; open them directly.
+design/*.html
+.uishots/

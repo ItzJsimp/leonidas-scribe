@@ -1,0 +1,65 @@
+{
+  "version": "1.0.0",
+  "triggers": {
+    "capture": {
+      "prefixes": [
+        "leonidas capture",
+        "leonidas remember",
+        "capture:",
+        "idea:",
+        "note:"
+      ],
+      "execution": "background",
+      "handler": "capture_aios_item"
+    },
+    "task": {
+      "prefixes": [
+        "leonidas task",
+        "leonidas action",
+        "task:"
+      ],
+      "execution": "paste",
+      "templates": {
+        "ai_chat": "/task-management new \"{title}\"",
+        "terminal": "pwsh -NoProfile -File scripts/skills/task-management/Invoke-TaskManagement.ps1 -Action New -Name \"{title}\"",
+        "default": "- [ ] {title}"
+      }
+    },
+    "slice": {
+      "prefixes": [
+        "leonidas slice",
+        "leonidas build"
+      ],
+      "execution": "paste",
+      "templates": {
+        "ai_chat": "/next-action {instruction}",
+        "terminal": "pwsh -NoProfile -File scripts/skills/autonomous-slice/Invoke-AutonomousSlice.ps1 -Phase Red",
+        "default": "### Autonomous Slice: {instruction}"
+      }
+    },
+    "review": {
+      "prefixes": [
+        "leonidas review",
+        "leonidas audit"
+      ],
+      "execution": "paste",
+      "templates": {
+        "ai_chat": "/aios-audit",
+        "terminal": "pwsh -NoProfile -File scripts/Detect-Drift.ps1",
+        "default": "Audit: {instruction}"
+      }
+    }
+  },
+  "context_gated_repairs": {
+    "scale": "skill",
+    "scales": "skills",
+    "mould": "mode",
+    "mold": "mode",
+    "clawed": "Claude",
+    "clawed code": "Claude Code",
+    "cloud code": "Claude Code",
+    "anti-gravity": "Antigravity",
+    "sub agent": "subagent",
+    "sub agents": "subagents"
+  }
+}

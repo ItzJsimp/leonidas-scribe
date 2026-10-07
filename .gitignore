@@ -1,0 +1,22 @@
+# Secrets and local user state (never commit)
+secrets.json
+*secret*
+config.json
+
+# Dictation history and logs
+history.jsonl*
+*.log
+crash.log
+recordings/
+reports/
+
+# Python cache and testing artifacts
+__pycache__/
+.pytest_cache/
+.uishots/
+macro_suggestions.json
+learned_corrections.json
+.audit-state.json
+
+# Models download cache
+models/
