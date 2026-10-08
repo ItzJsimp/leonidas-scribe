@@ -183,6 +183,9 @@ class AudioRecorder:
     def open(self):
         """(Re)open the persistent input stream. Re-initializes PortAudio first so a
         replugged or newly selected mic is visible without restarting the app."""
+        if self.is_recording:
+            print("[AudioRecorder] Re-open ignored: recording is active.")
+            return
         self.close()
         # Note: avoid sd._terminate() / sd._initialize() mid-session to prevent PortAudio C-memory corruption
         kw = dict(samplerate=self.sample_rate, channels=self.channels, dtype='int16',
@@ -1397,7 +1400,7 @@ if __name__ == "__main__":
     assert strip("I need to fix the HUD. Thank you") == "I need to fix the HUD."
     assert strip("Ship it, thanks for watching!") == "Ship it"
     assert strip("Push the branch. Thank you so much for watching.") == "Push the branch."
-    assert strip("Send it to Bird.") == "Send it to Bird."
+    assert strip("Send it to Blair.") == "Send it to Blair."
     # Genuine short sign-off survives: stripping would leave nothing.
     assert strip("Thank you") == "Thank you"
     # Real usage of the words mid-sentence is untouched.

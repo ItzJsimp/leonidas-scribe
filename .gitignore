@@ -20,3 +20,9 @@ learned_corrections.json
 
 # Models download cache
 models/
+
+# Meetings store
+meetings/
+
+# Compiled capture helper (build with Build-ScribeCapture.ps1)
+ScribeCapture.exe
