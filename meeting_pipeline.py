@@ -9,9 +9,11 @@ Handles:
 - Cost logging in manifest.json (<= $0.09/hr Discord, <= $0.12 gate)
 """
 import argparse
+import getpass
 import io
 import json
 import os
+import re
 import sys
 import time
 import wave
@@ -25,6 +27,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import meeting_recorder as mr
+import meeting_speakers as ms
+import meeting_store as mst
 
 SAMPLE_RATE = 16000
 GROQ_TURBO_USD_PER_SEC = 0.04 / 3600.0
@@ -206,13 +210,17 @@ def transcribe_chunk_groq(
     prompt_vocab: str = "",
     sample_rate: int = SAMPLE_RATE,
     retries: int = 2,
+    api_key_backup: str = "",
+    post_fn=None,
 ) -> dict:
-    """Transcribe a 10-30s chunk with Groq whisper-large-v3-turbo (429 fallback to whisper-large-v3)."""
+    """Transcribe a 10-30s chunk with Groq whisper-large-v3-turbo (429 instant backup key failover, then whisper-large-v3)."""
     wav_bytes = pcm_to_wav_bytes(pcm_int16, sample_rate)
     models = ["whisper-large-v3-turbo", "whisper-large-v3"]
     last_err = None
+    active_key = api_key or api_key_backup
+    backup_tried = False
     for attempt in range(retries + 1):
-        model = models[min(attempt, len(models) - 1)]
+        model = models[0] if (attempt == 0 or backup_tried) else models[min(attempt, len(models) - 1)]
         try:
             files = {"file": ("chunk.wav", io.BytesIO(wav_bytes), "audio/wav")}
             data = {
@@ -222,18 +230,48 @@ def transcribe_chunk_groq(
             }
             if prompt_vocab:
                 data["prompt"] = prompt_vocab[:800]
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                files=files,
-                data=data,
-                timeout=30,
-            )
-            if resp.status_code == 429 and attempt < retries:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            body = resp.json()
+            headers = {"Authorization": f"Bearer {active_key}"}
+            if post_fn is not None:
+                status_code, body = post_fn(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers, files, data, 30,
+                )
+                if status_code == 429 and api_key_backup and active_key != api_key_backup and not backup_tried:
+                    active_key = api_key_backup
+                    backup_tried = True
+                    status_code, body = post_fn(
+                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        {"Authorization": f"Bearer {active_key}"}, files, data, 30,
+                    )
+                if status_code == 429 and attempt < retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                if status_code >= 400:
+                    raise RuntimeError(f"HTTP {status_code}: {body}")
+            else:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                    timeout=30,
+                )
+                if resp.status_code == 429 and api_key_backup and active_key != api_key_backup and not backup_tried:
+                    active_key = api_key_backup
+                    backup_tried = True
+                    files = {"file": ("chunk.wav", io.BytesIO(wav_bytes), "audio/wav")}
+                    resp = requests.post(
+                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {active_key}"},
+                        files=files,
+                        data=data,
+                        timeout=30,
+                    )
+                if resp.status_code == 429 and attempt < retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                body = resp.json()
             text = (body.get("text") or "").strip()
             raw_words = body.get("words") or []
             words = []
@@ -281,25 +319,32 @@ def stitch_and_polish(
     them_speaker: str = "Them",
     dict_data: dict | None = None,
     llm_polish_fn=None,
+    attribute_fn=None,
 ) -> list[dict]:
+    """attribute_fn(chunk) -> list of chunk-shaped pieces (speaker_key/confidence/overlap set); used for Them chunks only."""
     chunks = sorted(read_chunks_jsonl(meeting_dir), key=lambda c: float(c.get("t0", 0.0)))
     raw_segments = []
     for ch in chunks:
         text = (ch.get("text") or "").strip()
         if not text:
             continue
-        speaker = me_speaker if ch.get("track") == "me" else ch.get("speaker_key") or them_speaker
-        raw_segments.append(
-            {
-                "speaker_key": speaker,
-                "t0": round(float(ch.get("t0", 0.0)), 3),
-                "t1": round(float(ch.get("t1", 0.0)), 3),
-                "text": text,
-                "confidence": ch.get("confidence", "high"),
-                "overlap": bool(ch.get("overlap", False)),
-                "words": ch.get("words") or interpolate_words(text, float(ch.get("t0", 0.0)), float(ch.get("t1", 0.0))),
-            }
-        )
+        pieces = attribute_fn(ch) if (attribute_fn and ch.get("track") != "me") else [ch]
+        for pc in pieces:
+            ptext = (pc.get("text") or "").strip()
+            if not ptext:
+                continue
+            speaker = me_speaker if pc.get("track") == "me" else pc.get("speaker_key") or them_speaker
+            raw_segments.append(
+                {
+                    "speaker_key": speaker,
+                    "t0": round(float(pc.get("t0", 0.0)), 3),
+                    "t1": round(float(pc.get("t1", 0.0)), 3),
+                    "text": ptext,
+                    "confidence": pc.get("confidence", "high"),
+                    "overlap": bool(pc.get("overlap", False)),
+                    "words": pc.get("words") or interpolate_words(ptext, float(pc.get("t0", 0.0)), float(pc.get("t1", 0.0))),
+                }
+            )
     segments = polish_windows(raw_segments, dict_data=dict_data, llm_polish_fn=llm_polish_fn)
     mr._atomic_write_json(os.path.join(meeting_dir, "transcript.json"), segments, fsync=True)
     return segments
@@ -414,6 +459,344 @@ def process_wav_fixture(
         chunker.push(data[i : i + step])
     chunker.flush()
     return stitch_and_polish(meeting_dir, me_speaker=speaker, them_speaker=speaker)
+
+
+# ---------------------------------------------------------------- post-call finalize (idempotent per stage)
+def load_scribe_config() -> dict:
+    try:
+        from engine import load_config_file
+
+        return load_config_file(os.path.join(HERE, "config.json"))
+    except Exception:
+        return {}
+
+
+def groq_keys(cfg: dict) -> tuple[str, str]:
+    """(primary, backup) Groq keys from config.api, then env; the backup doubles as primary when alone."""
+    api = (cfg or {}).get("api") or {}
+    backup = api.get("groq_api_key_backup") or os.environ.get("GROQ_API_KEY_BACKUP") or ""
+    return api.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or backup, backup
+
+
+def _patch_manifest(meeting_dir: str, **kw) -> dict:
+    m = mr.read_manifest(meeting_dir) or {}
+    m.update(kw)
+    mr.write_manifest(meeting_dir, m)
+    return m
+
+
+def _llm_chain(cfg: dict, note: bool = False) -> list[tuple[str, str, str]]:
+    """[(base_url, key, model)] tried in order: polish = Cerebras then Groq; note = Groq gpt-oss-120b (both keys)."""
+    api = (cfg or {}).get("api") or {}
+    gk, gb = groq_keys(cfg)
+    gurl = api.get("groq_base_url", "https://api.groq.com/openai/v1")
+    chain = []
+    ck = api.get("cerebras_api_key") or os.environ.get("CEREBRAS_API_KEY") or ""
+    if ck and not note:
+        chain.append((api.get("cerebras_base_url", "https://api.cerebras.ai/v1"), ck, api.get("cerebras_llm_model", "qwen-3.8-27b")))
+    model = "openai/gpt-oss-120b" if note else api.get("groq_oss_llm_model", "openai/gpt-oss-20b")
+    chain += [(gurl, k, model) for k in dict.fromkeys([gk, gb]) if k]
+    return chain
+
+
+def _chat(chain, messages, json_mode: bool = False, timeout: float = 90, post=None) -> str:
+    post = post or requests.post
+    last = None
+    for base, key, model in chain:
+        body = {"model": model, "messages": messages, "temperature": 0.1}
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        try:
+            r = post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body, timeout=timeout)
+            if r.status_code >= 400:
+                last = f"HTTP {r.status_code}"
+                continue
+            return r.json()["choices"][0]["message"]["content"] or ""
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"LLM chain failed: {last}")
+
+
+def _json_from_llm(text: str) -> dict:
+    m = re.search(r"\{.*\}", text or "", re.S)
+    return json.loads(m.group(0)) if m else {}
+
+
+def make_polish_fn(cfg: dict, chat=_chat):
+    """In-place window polish for polish_windows(); any failure leaves the dictionary-polished text untouched."""
+    chain = _llm_chain(cfg)
+    if not chain:
+        return None
+    system = (
+        "Fix mis-hearings, punctuation and names in these transcript lines. Keep wording and meaning. "
+        'Reply JSON only: the same keys mapped to the corrected lines. Never use an em dash.'
+    )
+
+    def polish(window: list[dict]) -> None:
+        lines = {str(i): s["text"] for i, s in enumerate(window)}
+        try:
+            out = _json_from_llm(chat(chain, [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(lines)}], json_mode=True))
+        except Exception:
+            return
+        for i, s in enumerate(window):
+            new = out.get(str(i))
+            # drift guard: a rewrite that changes the length a lot is a hallucination, not a polish
+            if isinstance(new, str) and new.strip() and abs(len(new) - len(s["text"])) <= 0.5 * len(s["text"]) + 20:
+                s["text"] = new.strip().replace(chr(0x2014), ", ")
+
+    return polish
+
+
+def load_template(template_id: str | None) -> str:
+    tid = os.path.basename(template_id or "default")
+    for name in (tid, "default"):
+        path = os.path.join(HERE, "meeting_templates", f"{name}.md")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+    return ""
+
+
+def _num(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def generate_note_data(manifest: dict, segments: list[dict], cfg: dict, chat=_chat) -> dict:
+    """Groq gpt-oss-120b JSON note following the chosen template's section instructions."""
+    chain = _llm_chain(cfg, note=True)
+    if not chain:
+        raise RuntimeError("no Groq key")
+    transcript = "\n".join(
+        f"[t={int(_num(s.get('t0')))}] {s.get('speaker_key') or 'Them'}: {s.get('text', '')}" for s in segments
+    )[:300000]  # ponytail: hard cap (about 75k tokens); chunked map-reduce if multi-hour calls need it
+    system = (
+        "You write concise meeting notes. Reply JSON only with keys: title (string), summary (list of strings), "
+        "decisions (list of {t: seconds, text}), action_items (list of {owner, task, t: seconds}), "
+        "open_questions (list of strings). Follow these section instructions:\n"
+        + load_template(manifest.get("template_id"))
+        + "\nNever use an em dash."
+    )
+    raw = _json_from_llm(chat(chain, [{"role": "system", "content": system}, {"role": "user", "content": transcript}], json_mode=True))
+    return {
+        "title": str(raw.get("title") or manifest.get("title") or "Meeting"),
+        "summary": [str(x) for x in raw.get("summary") or []],
+        "decisions": [{"t": _num(d.get("t")), "text": str(d.get("text", ""))} for d in raw.get("decisions") or [] if isinstance(d, dict)],
+        "action_items": [
+            {"owner": d.get("owner") or "", "task": str(d.get("task", "")), "t": _num(d.get("t"))}
+            for d in raw.get("action_items") or [] if isinstance(d, dict)
+        ],
+        "open_questions": [str(x) for x in raw.get("open_questions") or []],
+    }
+
+
+def _read_track(meeting_dir: str, track: str) -> np.ndarray:
+    parts = [sf.read(p, dtype="int16")[0] for p in mr._segment_files(meeting_dir, track)]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
+
+
+def _transcribe_missing(meeting_dir: str, stt, sample_rate: int = SAMPLE_RATE) -> int:
+    """Chunk both tracks' FLAC segments and transcribe chunks not yet in chunks.jsonl. Returns failed-chunk count."""
+    done = {(r.get("track"), round(_num(r.get("t0")), 3), round(_num(r.get("t1")), 3)) for r in read_chunks_jsonl(meeting_dir)}
+    failed = [0]
+    for track in ("me", "them"):
+        def on_chunk(t0, t1, pcm, track=track):
+            if (track, round(t0, 3), round(t1, 3)) in done:
+                return
+            try:
+                res = stt(pcm, t0, t1, track)
+            except Exception:
+                failed[0] += 1
+                return
+            append_chunk_jsonl(meeting_dir, {"track": track, "t0": t0, "t1": t1, "text": res.get("text", ""), "words": res.get("words", [])})
+
+        chunker = MeetingChunker(track=track, on_chunk=on_chunk, sample_rate=sample_rate)
+        step = int(sample_rate * 0.1)
+        for path in mr._segment_files(meeting_dir, track):
+            data, _sr = sf.read(path, dtype="int16")
+            for i in range(0, len(data), step):
+                chunker.push(data[i : i + step])
+        chunker.flush()
+    return failed[0]
+
+
+def _load_speaking_events(meeting_dir: str, manifest: dict, store_root: str) -> list[dict]:
+    path = os.path.join(meeting_dir, "speaking.jsonl")
+    if not os.path.exists(path):
+        return []
+    off = manifest.get("record_started_wall")
+    events = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue  # torn last line after a crash
+            if off and ev.get("wall") is not None:
+                ev["t"] = max(0.0, _num(ev["wall"]) - _num(off))
+            events.append(ev)
+    for uid in sorted({str(e.get("user_id")) for e in events if e.get("event") in ("start", "stop")}):
+        remembered = ms.lookup_remembered_discord_name(store_root, uid)
+        if remembered:
+            events.append({"event": "join", "user_id": uid, "name": remembered, "t": 0.0})
+    return events
+
+
+def _split_by_speaker(ch: dict, labelled: list[dict]) -> list[dict]:
+    """Group consecutive same-speaker words into pieces; a single-speaker chunk keeps its punctuated text."""
+    pieces: list[dict] = []
+    for w in labelled:
+        key = (w.get("speaker_key") or "Them", w.get("confidence", "high"), bool(w.get("overlap")))
+        if pieces and pieces[-1]["_k"] == key:
+            pieces[-1]["words"].append(w)
+            pieces[-1]["t1"] = w["t1"]
+        else:
+            pieces.append({"_k": key, "track": ch.get("track"), "speaker_key": key[0], "confidence": key[1],
+                           "overlap": key[2], "t0": w["t0"], "t1": w["t1"], "words": [w]})
+    if len(pieces) <= 1:
+        p = pieces[0] if pieces else {"speaker_key": "Them", "confidence": "?", "overlap": False}
+        return [dict(ch, speaker_key=p["speaker_key"], confidence=p["confidence"], overlap=p["overlap"])]
+    for p in pieces:
+        p.pop("_k")
+        p["text"] = " ".join(x["w"] for x in p["words"])
+    return pieces
+
+
+def make_attribute_fn(meeting_dir: str, manifest: dict, store_root: str):
+    """Them-chunk splitter: Discord speaking timeline if present, else local CPU diarization (assumes 2 speakers)."""
+    events = _load_speaking_events(meeting_dir, manifest, store_root)
+    chunks = read_chunks_jsonl(meeting_dir)
+    dur = max([_num(c.get("t1")) for c in chunks] or [1.0])
+    if any(e.get("event") in ("start", "stop") for e in events):
+        local = (manifest.get("discord") or {}).get("local_user_id")
+
+        def by_discord(ch):
+            words = ch.get("words") or interpolate_words(ch.get("text", ""), _num(ch.get("t0")), _num(ch.get("t1")))
+            return _split_by_speaker(ch, ms.attribute_discord_words(words, events, call_duration_s=dur, local_user_id=local))
+
+        return by_discord
+    pcm = _read_track(meeting_dir, "them")
+    diar = ms.diarize_local_cpu(pcm, num_speakers=2) if len(pcm) else []
+    if not diar:
+        return None
+
+    def by_diarization(ch):
+        words = ch.get("words") or interpolate_words(ch.get("text", ""), _num(ch.get("t0")), _num(ch.get("t1")))
+        out, last = [], "Them"
+        for w in words:
+            mid = (_num(w.get("t0")) + _num(w.get("t1"))) / 2.0
+            last = next((d["speaker"] for d in diar if d["t0"] <= mid <= d["t1"]), last)
+            out.append(dict(w, speaker_key=last, confidence="high", overlap=False))
+        return _split_by_speaker(ch, out)
+
+    return by_diarization
+
+
+def _merge_participants(meeting_dir: str, manifest: dict, store_root: str) -> None:
+    """People who joined mid-call are only in speaking.jsonl (the service never rewrites the manifest while recording)."""
+    seen = {str(p.get("discord_id")) for p in manifest.get("participants") or [] if p.get("discord_id")}
+    new = []
+    for e in _load_speaking_events(meeting_dir, manifest, store_root):
+        people = e.get("participants") or [] if e.get("event") == "channel" else [e] if e.get("event") == "join" else []
+        for p in people:
+            uid = str(p.get("discord_id") or p.get("user_id") or "")
+            if uid and uid not in seen and p.get("name"):
+                seen.add(uid)
+                new.append({"key": p["name"], "name": p["name"], "discord_id": uid, "avatar_path": None})
+    if new:
+        _patch_manifest(meeting_dir, participants=(manifest.get("participants") or []) + new)
+
+
+def _find_destination(cfg: dict, dest_id) -> dict | None:
+    for d in ((cfg or {}).get("meetings") or {}).get("destinations") or []:
+        if dest_id and dest_id in (d.get("id"), d.get("name")) and d.get("path"):
+            return d
+    return None
+
+
+def finalize_meeting(
+    meeting_dir: str,
+    cfg: dict | None = None,
+    store_root: str | None = None,
+    stt_fn=None,
+    note_fn=None,
+    polish_fn=None,
+) -> dict:
+    """Post-call pipeline: transcribe -> attribute -> stitch/polish -> note -> save -> Opus -> index -> cost -> ready.
+
+    Safe to rerun at any point (crash, recovery): every stage skips when its output already exists and only missing
+    chunks are re-sent. stt_fn(pcm, t0, t1, track) -> {text, words}; note_fn(manifest, segments) -> note_data;
+    polish_fn(window) are injectable for tests. Never raises for a missing key (state needs_key) or a stage error (failed).
+    """
+    cfg = cfg if cfg is not None else load_scribe_config()
+    store_root = store_root or os.path.dirname(os.path.abspath(meeting_dir))
+    manifest = mr.read_manifest(meeting_dir) or mr.init_meeting_dir(meeting_dir)
+    key, backup = groq_keys(cfg)
+    if not key and stt_fn is None:
+        _patch_manifest(meeting_dir, state="needs_key")
+        return {"state": "needs_key"}
+    try:
+        _patch_manifest(meeting_dir, state="processing", error=None)
+        if stt_fn is None:
+            vocab = ", ".join(load_dictionary().get("vocabulary") or [])
+
+            def stt_fn(pcm, t0, t1, track):
+                return transcribe_chunk_groq(pcm, t0, t1, api_key=key, prompt_vocab=vocab, api_key_backup=backup)
+
+        # 1. chunk + transcribe (resumable: chunks already in chunks.jsonl are skipped)
+        failed = _transcribe_missing(meeting_dir, stt_fn)
+        if failed:
+            _patch_manifest(meeting_dir, state="failed", error=f"{failed} chunk(s) failed to transcribe; rerun to retry")
+            return {"state": "failed", "failed_chunks": failed}
+
+        # 2. attribute + stitch + polish -> transcript.json
+        tpath = os.path.join(meeting_dir, "transcript.json")
+        if not os.path.exists(tpath):
+            me_name = ((cfg.get("user") or {}).get("name") or "").strip() or getpass.getuser()
+            stitch_and_polish(
+                meeting_dir,
+                me_speaker=me_name,
+                llm_polish_fn=polish_fn if polish_fn is not None else make_polish_fn(cfg),
+                attribute_fn=make_attribute_fn(meeting_dir, manifest, store_root),
+            )
+        segments = mr._read_json(tpath) or []
+        _merge_participants(meeting_dir, manifest, store_root)
+
+        # 3. note (cached in note.json) + save to destination (note + transcript files)
+        npath = os.path.join(meeting_dir, "note.json")
+        note_data = mr._read_json(npath)
+        if note_data is None:
+            try:
+                note_data = (note_fn or (lambda m, s: generate_note_data(m, s, cfg)))(manifest, segments)
+                mr._atomic_write_json(npath, note_data, fsync=True)
+            except Exception as e:
+                # transcript.json is already safe locally; audio is kept and a rerun retries only the note
+                _patch_manifest(meeting_dir, state="failed" if key else "needs_key", error=f"note: {e}"[:300])
+                return {"state": "failed" if key else "needs_key", "error": str(e)}
+        manifest = mr.read_manifest(meeting_dir) or manifest
+        dest = _find_destination(cfg, manifest.get("destination_id"))
+        saved = manifest.get("note_path")
+        if dest and not (saved and os.path.exists(saved)):
+            paths = mst.save_meeting_to_destination(meeting_dir, dest, note_data=note_data, store_root=store_root)
+            _patch_manifest(meeting_dir, note_path=paths["note_path"], transcript_path=paths["transcript_path"])
+
+        # 4. Opus (deletes FLAC only after verified read-back); skipped once segments are gone
+        if mr._segment_files(meeting_dir, "me") or mr._segment_files(meeting_dir, "them"):
+            finalize_opus(meeting_dir)
+
+        # 5. index + cost
+        mst.index_meeting(store_root, meeting_dir)
+        rows = read_chunks_jsonl(meeting_dir)
+        voiced = {t: sum(_num(r.get("t1")) - _num(r.get("t0")) for r in rows if r.get("track") == t) for t in ("me", "them")}
+        tokens = sum(len(s.get("text", "")) for s in segments) // 4 + 1000
+        estimate_and_log_call_cost(meeting_dir, voiced["me"], voiced["them"], polish_tokens=tokens)
+        _patch_manifest(meeting_dir, state="ready")
+        return {"state": "ready", "segments": len(segments)}
+    except Exception as e:
+        _patch_manifest(meeting_dir, state="failed", error=str(e)[:300])
+        return {"state": "failed", "error": str(e)}
 
 
 def main(argv=None) -> int:

@@ -179,6 +179,96 @@ def resample_pcm_s16le(raw_bytes: bytes, src_rate: int, src_channels: int, dst_r
     return np.interp(x_new, x_old, samples.astype(np.float32)).astype(np.int16)
 
 
+def _wasapi_input_device(sd, device_index=None):
+    """The WASAPI entry for the selected mic (default mic when None); same logic as engine.AudioRecorder._wasapi_twin."""
+    apis = sd.query_hostapis()
+    wi = next(i for i, h in enumerate(apis) if "WASAPI" in h["name"])
+    if device_index is None:
+        return apis[wi]["default_input_device"]
+    d = sd.query_devices(device_index)
+    if d["hostapi"] == wi:
+        return device_index
+    name = d["name"].strip()
+    return next(
+        i for i, w in enumerate(sd.query_devices())
+        if w["hostapi"] == wi and w["max_input_channels"] > 0 and w["name"].startswith(name)
+    )
+
+
+def _configured_mic_device(source: dict | None):
+    """Manifest source.mic_device wins, then config.json audio.device_index, else None (default mic)."""
+    if (source or {}).get("mic_device") is not None:
+        return source["mic_device"]
+    cfg = _read_json(os.path.join(HERE, "config.json")) or {}
+    return (cfg.get("audio") or {}).get("device_index")
+
+
+class MicCapture:
+    """16 kHz mono int16 mic feed (sounddevice WASAPI, auto_convert) for the Me track.
+    Never raises: a dead or missing device just reports ok=False and read() returns zeros."""
+
+    MAX_FRAMES = SAMPLE_RATE * 5
+    STALE_S = 2.5
+
+    def __init__(self, device=None, sd_module=None):
+        self.device = device
+        self._sd = sd_module
+        self._stream = None
+        self._pending = np.zeros(0, dtype=np.int16)
+        self._lock = threading.Lock()
+        self._last_cb = 0.0
+
+    def _cb(self, indata, frames, time_info, status):
+        self._last_cb = time.monotonic()
+        chunk = np.asarray(indata, dtype=np.int16).reshape(-1)
+        with self._lock:
+            self._pending = np.concatenate((self._pending, chunk))[-self.MAX_FRAMES:]
+
+    def start(self) -> bool:
+        try:
+            sd = self._sd
+            if sd is None:
+                import sounddevice as sd
+            kw = dict(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=480, callback=self._cb)
+            try:
+                self._stream = sd.InputStream(
+                    device=_wasapi_input_device(sd, self.device),
+                    extra_settings=sd.WasapiSettings(auto_convert=True),
+                    **kw,
+                )
+            except Exception:
+                self._stream = sd.InputStream(device=self.device, **kw)
+            self._stream.start()
+            self._last_cb = time.monotonic()
+        except Exception:
+            self._stream = None
+        return self._stream is not None
+
+    @property
+    def ok(self) -> bool:
+        return self._stream is not None and (time.monotonic() - self._last_cb) < self.STALE_S
+
+    def read(self, n: int) -> np.ndarray:
+        with self._lock:
+            out, self._pending = self._pending[:n], self._pending[n:]
+        if len(out) < n:
+            out = np.concatenate((out, np.zeros(n - len(out), dtype=np.int16)))
+        return out
+
+    def close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+
+def _level(block: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(block.astype(np.float32) ** 2))) / 32768.0 if len(block) else 0.0
+
+
 def send_worker_command(meeting_dir: str, cmd: str) -> None:
     _atomic_write_json(
         os.path.join(meeting_dir, "control.json"),
@@ -330,9 +420,18 @@ def run_worker_loop(
     synthetic: bool = False,
     segment_seconds: float = 10.0,
     heartbeat_interval: float = 2.0,
+    finalize: bool | None = None,
+    mic_sd=None,
 ) -> int:
+    """Record until control.json says stop, then (real recordings only) run the post-call pipeline."""
+    if finalize is None:
+        finalize = not synthetic
     init_meeting_dir(meeting_dir)
     manifest = read_manifest(meeting_dir) or {}
+    if not manifest.get("record_started_wall"):
+        # lets finalize align Discord speaking events (wall clock) to the audio timeline
+        manifest["record_started_wall"] = time.time()
+        write_manifest(meeting_dir, manifest)
     seg_idx = _highest_segment_index(meeting_dir)
     base_seconds = saved_audio_seconds(meeting_dir, "me")
     block_s = 0.1
@@ -349,8 +448,12 @@ def run_worker_loop(
     last_chunk_time = None
 
     cap_proc = None
+    mic = None
+    lvl_me = lvl_them = 0.0
     if not synthetic:
         src = manifest.get("source") or {}
+        mic = MicCapture(_configured_mic_device(src), sd_module=mic_sd)
+        mic.start()
         exe = os.path.join(HERE, "ScribeCapture.exe")
         if os.path.exists(exe):
             args = [exe, "--pid", str(src["pid"])] if src.get("kind") == "app" and src.get("pid") else [
@@ -379,6 +482,7 @@ def run_worker_loop(
                 "them_segments": seg_idx,
                 "last_chunk_time": last_chunk_time,
                 "levels": {"me": round(rms_me, 5), "them": round(rms_them, 5)},
+                "mic_ok": True if mic is None and synthetic else bool(mic and mic.ok),
                 "heartbeat_at": time.time(),
             },
         )
@@ -402,7 +506,7 @@ def run_worker_loop(
             t_step = time.monotonic()
             if state == "recording":
                 if synthetic or cap_proc is None:
-                    me_block = np.zeros(block_frames, dtype=np.int16)
+                    me_block = mic.read(block_frames) if mic is not None else np.zeros(block_frames, dtype=np.int16)
                     them_block = np.zeros(block_frames, dtype=np.int16)
                 else:
                     raw = cap_proc.stdout.read(block_frames * 2)
@@ -411,8 +515,10 @@ def run_worker_loop(
                         if raw and len(raw) == block_frames * 2
                         else np.zeros(block_frames, dtype=np.int16)
                     )
-                    me_block = np.zeros(block_frames, dtype=np.int16)
+                    me_block = mic.read(block_frames) if mic is not None else np.zeros(block_frames, dtype=np.int16)
 
+                lvl_me = max(lvl_me, _level(me_block))
+                lvl_them = max(lvl_them, _level(them_block))
                 me_buf.append(me_block)
                 them_buf.append(them_block)
                 me_frames_in_seg += len(me_block)
@@ -432,13 +538,16 @@ def run_worker_loop(
 
             now_m = time.monotonic()
             if (now_m - last_hb) >= heartbeat_interval:
-                _emit_heartbeat(state)
+                _emit_heartbeat(state, lvl_me, lvl_them)
+                lvl_me = lvl_them = 0.0
                 last_hb = now_m
 
             elapsed = time.monotonic() - t_step
             if elapsed < block_s:
                 time.sleep(block_s - elapsed)
     finally:
+        if mic is not None:
+            mic.close()
         if cap_proc is not None:
             try:
                 if cap_proc.stdin:
@@ -458,6 +567,16 @@ def run_worker_loop(
         manifest["state"] = "processing"
         write_manifest(meeting_dir, manifest)
         _emit_heartbeat("stopped")
+    if finalize:
+        try:
+            import meeting_pipeline as mp  # lazy: meeting_pipeline imports this module
+
+            mp.finalize_meeting(meeting_dir)
+        except Exception as e:  # never leave the state stuck on 'processing'
+            m = read_manifest(meeting_dir) or {}
+            m["state"], m["error"] = "failed", str(e)[:300]
+            write_manifest(meeting_dir, m)
+        _emit_heartbeat((read_manifest(meeting_dir) or {}).get("state", "stopped"))
     return 0
 
 

@@ -18,6 +18,17 @@ from .styles import T
 # Segoe MDL2 / Fluent codepoints (present in both fonts).
 GLYPH = {
     "play":      "\uE768",
+    "pause":     "\uE769",
+    "chevron_right": "\uE76C",
+    "chevron_left":  "\uE76B",
+    "folder":    "\uE8B7",
+    "people":    "\uE716",
+    "calendar":  "\uE787",
+    "clock":     "\uE823",
+    "expand":    "\uE740",
+    "pin":       "\uE718",
+    "send":      "\uE724",
+    "upload":    "\uE898",
     "stop":      "\uE71A",
     "home":      "\uE80F",
     "bulb":      "\uEA80",

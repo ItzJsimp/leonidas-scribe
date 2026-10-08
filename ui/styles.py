@@ -28,6 +28,7 @@ T = {
     "obsidian_600": "#3a3a48",   # border strong, scrollbar hover
     "glass":        "rgba(21, 21, 27, 0.72)",
     "hairline":     "rgba(255, 255, 255, 0.06)",
+    "scrim":        "rgba(7, 7, 10, 0.82)",
 
     # Ink
     "ink":          "#f4f4f5",   # 18.3:1
@@ -252,6 +253,115 @@ QFrame#StatusBlock {
     border: 1px solid $hairline;
     border-radius: $r_control;
 }
+QFrame#SideSheet {
+    background-color: $obsidian_900;
+    border: none;
+    border-left: 1px solid $obsidian_700;
+}
+QFrame#OverlayScrim {
+    background-color: $scrim;
+}
+QFrame#OverlayFrame {
+    background-color: $obsidian_900;
+    border: 1px solid $obsidian_700;
+    border-radius: $r_panel;
+}
+QFrame#PlayerBar {
+    background-color: $obsidian_850;
+    border: 1px solid $hairline;
+    border-radius: $r_control;
+}
+QFrame#PillIsland, QFrame#PillCapsule {
+    background-color: $obsidian_900;
+    border: 1px solid $obsidian_700;
+    border-radius: 18px;
+}
+QFrame#PillPanel {
+    background-color: $obsidian_900;
+    border: 1px solid $obsidian_600;
+    border-radius: $r_panel;
+}
+QFrame#CallPromptToast {
+    background-color: $obsidian_850;
+    border: 1px solid $obsidian_600;
+    border-radius: $r_card;
+}
+
+/* ---------- meetings (S6) ---------- */
+QFrame#Card[selected="true"] { border: 1px solid $cyan; }
+QLabel#CardTitleMono { font-family: $font_mono; font-size: $fs_body; font-weight: 600; color: $ink; }
+QLabel#SheetTitle  { font-family: $font_display; font-size: $fs_heading; font-weight: 800; color: $ink; }
+QLabel#Speaker     { font-size: $fs_body; font-weight: 600; color: $ink; }
+QLabel#NumCyan     { font-family: $font_mono; font-size: $fs_body; color: $cyan; }
+QLabel#PillTime    { font-family: $font_mono; font-size: $fs_title; font-weight: 600; color: $ink; }
+QLabel#Chip {
+    font-size: $fs_label; font-weight: 600; color: $ink_muted;
+    background-color: $obsidian_800; border: 1px solid $obsidian_700;
+    border-radius: 6px; padding: 1px 8px;
+}
+QLabel#Avatar {
+    font-family: $font_mono; font-size: $fs_micro; font-weight: 600; color: $ink_muted;
+    background-color: $obsidian_800; border: 1px solid $obsidian_600; border-radius: 10px;
+}
+QLabel#BulletDot { background-color: $cyan; border-radius: 2px; }
+QLabel#RecDot { background-color: $crimson_text; border-radius: 5px; }
+QLabel#RecDot[state="paused"] { background-color: $gold; }
+QLabel#RecDot[state="dead"]   { background-color: $error; }
+QLabel#AskQuestion {
+    font-size: $fs_body; color: $ink; background-color: $obsidian_800;
+    border-radius: $r_control; padding: 6px 10px;
+}
+QFrame#AskBox { background-color: $obsidian_900; border: none; border-top: 1px solid $obsidian_700; }
+QFrame#AnswerCard { background-color: $obsidian_850; border: 1px solid $obsidian_700; border-radius: $r_control; }
+QFrame#TranscriptRow { background: transparent; border: none; border-radius: $r_control; }
+QFrame#TranscriptRow[active="true"] { background-color: $cyan_soft; }
+
+/* Underline tabs (Meetings filters, sheet Summary | Transcript). */
+QPushButton#TabBtn {
+    background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0px;
+    color: $ink_muted; font-weight: 600; padding: 6px 2px;
+}
+QPushButton#TabBtn:hover   { color: $ink; }
+QPushButton#TabBtn:checked { color: $ink; border-bottom: 2px solid $cyan; }
+QPushButton#TabBtn:focus   { color: $cyan; }
+/* Mono timestamp that plays audio from that moment. */
+QPushButton#TimeLink {
+    background: transparent; border: 1px solid transparent; border-radius: 4px;
+    color: $cyan; font-family: $font_mono; font-size: $fs_label; font-weight: 500; padding: 2px 4px;
+    text-align: left;
+}
+QPushButton#TimeLink:hover { color: $ink; background-color: $cyan_soft; }
+QPushButton#TimeLink:focus { border: 1px solid $cyan; }
+QPushButton#TimeLink:disabled { color: $ink_dim; }
+QPushButton#ChipBtn, QPushButton#PersonChip {
+    background-color: $obsidian_850; border: 1px solid $obsidian_700; border-radius: 13px;
+    color: $ink_muted; font-weight: 500; padding: 3px 10px;
+}
+QPushButton#ChipBtn:hover, QPushButton#PersonChip:hover { color: $ink; border-color: $obsidian_600; }
+QPushButton#ChipBtn:focus, QPushButton#PersonChip:focus { border: 1px solid $cyan; }
+QPushButton#PersonChip { color: $ink; }
+QPushButton#PlayBtn {
+    background-color: $cyan_soft; border: 1px solid transparent; border-radius: 14px; padding: 0px;
+}
+QPushButton#PlayBtn:hover { border-color: $cyan; }
+QPushButton#PlayBtn:focus { border: 1px solid $cyan; }
+QPushButton#PlayBtn:disabled { background-color: $obsidian_800; }
+QPushButton#PillBtn {
+    background-color: $obsidian_800; border: 1px solid transparent; border-radius: 14px; padding: 0px;
+}
+QPushButton#PillBtn:hover { border-color: $obsidian_600; }
+QPushButton#PillBtn:focus { border: 1px solid $cyan; }
+QPushButton#AccentBtn {
+    background-color: $cyan_soft; border: 1px solid transparent; color: $cyan; padding: 6px 12px;
+    border-radius: 14px;
+}
+QPushButton#AccentBtn:hover { border-color: $cyan; }
+/* Meetings Record: cyan is "live"; crimson stays with Dictate (one per view). */
+QPushButton#RecordBtn { background-color: $cyan_soft; border: 1px solid transparent; color: $cyan; }
+QPushButton#RecordBtn:hover { border-color: $cyan; }
+QPushButton#RecordBtn:focus { border: 1px solid $cyan; }
+QPushButton#RecordBtn:disabled { color: $ink_dim; background-color: $obsidian_850; }
+QPushButton#AccentBtn:focus { border: 1px solid $cyan; }
 
 /* ---------- buttons ---------- */
 /* Default = secondary: obsidian-800 with a border that strengthens on hover. */
@@ -375,7 +485,7 @@ QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus { border: 1px solid $cyan
 QLineEdit:disabled, QTextEdit:disabled { color: $ink_dim; background-color: $obsidian_950; }
 QTextEdit#Mono, QPlainTextEdit#Mono { font-family: $font_mono; font-size: $fs_body; }
 
-QComboBox, QSpinBox, QDoubleSpinBox {
+QComboBox, QSpinBox, QDoubleSpinBox, QDateTimeEdit {
     background-color: $obsidian_900;
     color: $ink;
     border: 1px solid $obsidian_700;
@@ -384,8 +494,8 @@ QComboBox, QSpinBox, QDoubleSpinBox {
     font-size: $fs_body;
     min-height: 18px;
 }
-QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: $obsidian_600; }
-QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid $cyan; }
+QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QDateTimeEdit:hover { border-color: $obsidian_600; }
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus { border: 1px solid $cyan; }
 QComboBox:disabled, QSpinBox:disabled { color: $ink_dim; background-color: $obsidian_950; }
 QSpinBox, QDoubleSpinBox { font-family: $font_mono; }
 QComboBox::drop-down {

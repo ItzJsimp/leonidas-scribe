@@ -77,7 +77,7 @@ def _extract_topic_keywords(text: str, max_terms: int = 8) -> list:
 
 # API keys never live in the git-tracked config.json: they sit in a sibling
 # secrets.json (gitignored by the repo's *secret* rule) and are merged in on load.
-SECRET_KEYS = ("groq_api_key", "cerebras_api_key", "gemini_api_key")
+SECRET_KEYS = ("groq_api_key", "groq_api_key_backup", "cerebras_api_key", "gemini_api_key")
 
 
 def _secrets_path(config_path: str) -> str:
@@ -428,7 +428,8 @@ class DictationEngine:
         self.config = load_config_file(self.config_path)
 
         api = self.config.get("api", {})
-        self.groq_api_key = api.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or ""
+        self.groq_api_key_backup = api.get("groq_api_key_backup") or os.environ.get("GROQ_API_KEY_BACKUP") or ""
+        self.groq_api_key = api.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or self.groq_api_key_backup or ""
         self.cerebras_api_key = api.get("cerebras_api_key") or os.environ.get("CEREBRAS_API_KEY") or ""
         self.gemini_api_key = api.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
@@ -562,6 +563,14 @@ class DictationEngine:
                       f"Retry {attempt + 1}/{self.max_api_retries} in {wait:.0f}s")
                 time.sleep(wait)
                 continue
+            if resp.status_code == 429:
+                backup_key = getattr(self, "groq_api_key_backup", "") or ""
+                hdrs = kwargs.get("headers") or {}
+                if backup_key and hdrs.get("Authorization") == f"Bearer {self.groq_api_key}" and backup_key != self.groq_api_key:
+                    hdrs["Authorization"] = f"Bearer {backup_key}"
+                    kwargs["headers"] = hdrs
+                    print(f"[LeonidasScribe Engine] {label} got 429 on primary Groq key; routing immediately to groq_api_key_backup.")
+                    continue
             if resp.status_code == 429 or resp.status_code >= 500:
                 wait = float(resp.headers.get("retry-after") or 0) or 2.0 * (2 ** attempt)
                 wait = min(wait, 30.0)
@@ -927,6 +936,14 @@ class DictationEngine:
             payload["reasoning_effort"] = "low"  # gpt-oss cannot turn reasoning off; default medium is slow
 
         resp = self.session.post(f"{url}/chat/completions", headers=headers, json=payload, timeout=timeout or self.polish_timeout)
+        if resp.status_code == 429:
+            backup_key = getattr(self, "groq_api_key_backup", "") or ""
+            if backup_key and key == getattr(self, "groq_api_key", "") and backup_key != key:
+                headers = dict(headers)
+                headers["Authorization"] = f"Bearer {backup_key}"
+                self.last_failover = f"groq_primary -> groq_backup ({model})"
+                print(f"[LeonidasScribe Engine] Polish 429 on primary Groq key; routing immediately to groq_api_key_backup ({model})")
+                resp = self.session.post(f"{url}/chat/completions", headers=headers, json=payload, timeout=timeout or self.polish_timeout)
         if resp.status_code == 400 and "reasoning_effort" in payload:
             del payload["reasoning_effort"]
             resp = self.session.post(f"{url}/chat/completions", headers=headers, json=payload, timeout=timeout or self.polish_timeout)
@@ -1391,6 +1408,9 @@ class DictationEngine:
             # A pause right after a finished sentence is still a paragraph break.
             text = re.sub(SENTENCE_END_PAUSE, r"\1\n\n", text)
         return re.sub(r"\s*" + PAUSE_MARKER + r"\s*", " ", text).strip()
+
+
+Engine = DictationEngine
 
 if __name__ == "__main__":
     # Smallest check that fails if the hallucination filter breaks.

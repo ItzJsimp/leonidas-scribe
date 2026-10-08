@@ -29,6 +29,7 @@ from ui.views.transcripts import TranscriptsView
 from ui.views.insights import InsightsView
 from ui.views.dictionary import DictionaryView
 from ui.views.voice import VoiceView
+from ui.views.meetings import MeetingsView
 from ui.views.home import HomeView
 from ui.views.settings import SECTIONS, SettingsView
 from ui.widgets import AudioPlayer, Toast, button, kbd, tab_focus_only, section_label
@@ -48,6 +49,7 @@ class DashboardWindow(QMainWindow):
         ("chart", "Insights"),
         ("library", "Dictionary"),
         ("volume", "Voice"),
+        ("mic", "Meetings"),
         ("settings", "Settings"),
     ]
 
@@ -182,10 +184,11 @@ class DashboardWindow(QMainWindow):
         self.insights_view = InsightsView(self)
         self.dictionary_view = DictionaryView(self)
         self.voice_view = VoiceView(self)
+        self.meetings_view = MeetingsView(self)
         self.settings_view = SettingsView(self)
         self.settings_view.dirty_changed.connect(self._on_settings_dirty)
         for view in (self.home_view, self.history_view, self.transforms_view, self.insights_view,
-                     self.dictionary_view, self.voice_view, self.settings_view):
+                     self.dictionary_view, self.voice_view, self.meetings_view, self.settings_view):
             self.tabs.addWidget(view)
 
         # Expose sub-view controls on DashboardWindow for test contracts and callers
@@ -198,7 +201,7 @@ class DashboardWindow(QMainWindow):
         for attr in (
             "cb_mic", "spin_max_sec", "spin_pause_sec",
             "cb_primary_prov", "cb_primary_model", "cb_backup_prov", "cb_backup_model",
-            "cb_stt", "in_groq_key", "in_cerebras_key",
+            "cb_stt", "in_groq_key", "in_groq_backup_key", "in_cerebras_key",
             "btn_rec_toggle", "btn_rec_ptt", "btn_rec_capture", "btn_rec_transform",
             "txt_polish_instructions", "presets_container",
             "chk_failover", "chk_sound", "chk_hud", "chk_notify", "chk_lenses",
@@ -449,7 +452,7 @@ class DashboardWindow(QMainWindow):
             btn.setChecked(i == index)
             btn.setIcon(glyph_icon(self.NAV[i][0], 15, TOKENS["ink"] if i == index else TOKENS["ink_muted"]))
         page = self.tabs.widget(index)
-        if page in (self.insights_view, self.home_view):
+        if page in (self.insights_view, self.home_view, self.meetings_view):
             page.refresh()
         motion.fade_in(page, 240)
 

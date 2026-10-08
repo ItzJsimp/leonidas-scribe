@@ -124,7 +124,7 @@ def release_single_instance():
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject, Signal, QTimer
 
-from engine import AudioRecorder, DictationEngine, load_config_file
+from engine import AudioRecorder, DictationEngine, load_config_file, save_config_file
 
 def engine_strip(text: str) -> str:
     return DictationEngine.strip_pause_markers(text or "")
@@ -168,6 +168,11 @@ class ScribeBridge(QObject):
     # A source .py changed and Scribe has been idle+quiet for the debounce window:
     # re-exec on the main thread instead of an agent Stop-Process'ing a live instance.
     sig_restart_for_update = Signal()
+    # Scribe Meetings (meeting_service.py): its callbacks fire on background threads and only emit these;
+    # the slots run on the GUI thread (agent-playbook.md section 5b).
+    sig_meeting_prompt = Signal(str, str, object, object)  # place, destination, record_cb, never_cb
+    sig_meeting_recovery = Signal(str, object, object)  # message, resume_cb, decline_cb
+    sig_meeting_started = Signal(object)  # source dict
 
 
 class LeonidasScribeApp:
@@ -361,6 +366,67 @@ class LeonidasScribeApp:
         self._reply_poll_timer.timeout.connect(self._poll_reply_window)
         self._reply_poll_timer.start(1000)
 
+        self._init_meetings()
+
+    def _init_meetings(self):
+        """Scribe Meetings glue. The service owns Discord RPC, call detection, auto-stop, recovery and retention
+        on its own threads; this only forwards its callbacks to the GUI thread through the bridge."""
+        self._meeting_service = None
+        self._meeting_boxes = []
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return  # tests that build the real app must not dial live Discord or scan the real meeting store
+        try:
+            from meeting_service import MeetingService
+
+            self.bridge.sig_meeting_prompt.connect(self._on_meeting_prompt)
+            self.bridge.sig_meeting_recovery.connect(self._on_meeting_recovery)
+            self.bridge.sig_meeting_started.connect(self._on_meeting_started)
+            self._meeting_service = MeetingService(
+                get_config=lambda: self.config,
+                save_config=lambda cfg: save_config_file(cfg, self.config_path),
+                on_prompt=lambda *a: self.bridge.sig_meeting_prompt.emit(*a),
+                on_recovery=lambda *a: self.bridge.sig_meeting_recovery.emit(*a),
+                on_start=lambda src: self.bridge.sig_meeting_started.emit(src),
+                on_status=self._on_meeting_status,
+            )
+            self._meeting_service.start()  # no-op unless meetings.enabled
+        except Exception as e:
+            print(f"[LeonidasScribe] Meetings init warning: {e}")
+
+    def _meetings_view(self):
+        return getattr(getattr(self, "dashboard", None), "meetings_view", None)
+
+    def _on_meeting_status(self, kind, info):
+        """Background thread: alert through the bridge only for outcomes the user must act on."""
+        msgs = {"needs_key": "Add a Groq API key in Settings to finish transcribing this call.",
+                "failed": "A meeting could not be processed. Open Meetings to retry.",
+                "finalized": "Meeting notes are ready."}
+        if kind in msgs:
+            self.bridge.sig_alert.emit("Scribe Meetings", msgs[kind])
+
+    def _on_meeting_prompt(self, place, destination, record_cb, never_cb):
+        show = getattr(self._meetings_view(), "show_call_prompt", None)
+        if show:
+            show(place, destination, record_cb, never_cb)
+
+    def _on_meeting_started(self, source):
+        start = getattr(self._meetings_view(), "start_recording", None)
+        if start:
+            start(source)
+
+    def _on_meeting_recovery(self, message, resume_cb, decline_cb):
+        show = getattr(self._meetings_view(), "show_recovery_prompt", None)
+        if show:
+            return show(message, resume_cb, decline_cb)
+        from PySide6.QtWidgets import QMessageBox
+
+        box = QMessageBox(QMessageBox.Question, "Scribe Meetings", message, QMessageBox.NoButton, self.dashboard)
+        resume = box.addButton("Resume", QMessageBox.AcceptRole)
+        box.addButton("Decline", QMessageBox.RejectRole)
+        box.buttonClicked.connect(lambda b: resume_cb() if b is resume else decline_cb())
+        self._meeting_boxes.append(box)
+        box.open()  # non-modal: never spins a nested event loop on the GUI thread
+
     def _on_card_action_or_reply(self, *args):
         """User responded via Card: stop voice listening if reply window is open."""
         if self.is_recording and self.current_mode == "reply":
@@ -493,6 +559,9 @@ class LeonidasScribeApp:
             self.hotkeys.stop()
         if hasattr(self, "recorder"):
             self.recorder.close()
+        # Stops RPC and polling only: a detached recorder worker keeps recording after Scribe exits.
+        if getattr(self, "_meeting_service", None):
+            self._meeting_service.stop()
 
     def _apply_hud_config(self):
         hud_cfg = self.config.get("hud", {})
@@ -507,6 +576,8 @@ class LeonidasScribeApp:
         self.engine.load_config()
         self.live_engine.load_config()
         self._apply_hud_config()
+        if getattr(self, "_meeting_service", None):
+            self._meeting_service.refresh()
         # Earcons, HUD and Calm apply live: these used to need a restart.
         audio_cfg = self.config.get("audio", {})
         self.audio_feedback.enabled = audio_cfg.get("sound_feedback", True)
