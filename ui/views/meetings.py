@@ -207,7 +207,11 @@ def new_meeting_dir(root: str, title: str) -> str:
 
 
 def finalize_meeting(mdir: str, me_name: str = "Me") -> dict:
-    """Post-call: stitch finished chunks, encode Opus, mark ready. Idempotent."""
+    """Post-call. Prefers the full pipeline (meeting_pipeline.finalize_meeting: transcribe, attribute, polish,
+    note, save, Opus, index, cost; never raises). Fallback: stitch finished chunks, encode Opus, mark ready."""
+    full = getattr(mp, "finalize_meeting", None)
+    if full is not None:
+        return full(mdir)
     if mp.read_chunks_jsonl(mdir):
         mp.stitch_and_polish(mdir, me_speaker=me_name)
     try:
@@ -2011,9 +2015,17 @@ class MeetingsView(QWidget):
         if self.rec_dir:
             self.stop_recording()
             return
+        box = QMessageBox(QMessageBox.Icon.Question, "Record a meeting",
+                          "Record your mic and the computer's audio as two tracks?\n\nAfter you stop, Groq "
+                          "whisper-large-v3-turbo transcribes it and gpt-oss-120b writes the note: about $0.09 per "
+                          "Discord hour, $0.26 for other apps.", QMessageBox.StandardButton.Cancel, self)
+        ok = box.addButton("Start recording", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is not ok:
+            return
         audio = (getattr(self.host, "config", None) or {}).get("audio") or {}
         self.start_recording({"kind": "device", "app": None, "pid": None, "device": "default",
-                              "mic": audio.get("device_index")})
+                              "mic_device": audio.get("device_index")})
 
     def start_recording(self, source: dict):
         """Public API for the app shell. source: manifest source {kind, app, pid, device, mic} plus optional
@@ -2082,8 +2094,17 @@ class MeetingsView(QWidget):
         def job():
             mr.stop_worker(mdir)
             return finalize_meeting(mdir, me)
-        self._async(job, lambda _: (self.host.toast(f"Saved {title}", "success"), self.refresh()),
+        self._async(job, lambda res: (self._finished_toast(title, res), self.refresh()),
                     "Could not finish the meeting")
+
+    def _finished_toast(self, title: str, res):
+        state = (res or {}).get("state")
+        if state == "needs_key":
+            self.host.toast(f"{title} is saved, but needs a Groq key to transcribe. Add one in Settings, Models.", "warn")
+        elif state == "failed":
+            self.host.toast(f"{title} is saved; transcription failed. It retries on the next start.", "error")
+        else:
+            self.host.toast(f"Saved {title}", "success")
 
     def toggle_pause(self):
         if not self.rec_dir:
@@ -2107,7 +2128,7 @@ class MeetingsView(QWidget):
         me = self._user_name()
         self._release()
         self._async(lambda: mr.decline_resume(mdir, pipeline_fn=lambda d: finalize_meeting(d, me)),
-                    lambda _: (self.host.toast("Finished with what was saved", "success"), self.refresh()),
+                    lambda res: (self._finished_toast("The recording", res), self.refresh()),
                     "Could not finish the meeting")
 
     def pill(self) -> MeetingPillWidget:
