@@ -289,7 +289,6 @@ QFrame#CallPromptToast {
 
 /* ---------- meetings (S6) ---------- */
 QFrame#Card[selected="true"] { border: 1px solid $cyan; }
-QLabel#CardTitleMono { font-family: $font_mono; font-size: $fs_body; font-weight: 600; color: $ink; }
 QLabel#SheetTitle  { font-family: $font_display; font-size: $fs_heading; font-weight: 800; color: $ink; }
 QLabel#Speaker     { font-size: $fs_body; font-weight: 600; color: $ink; }
 QLabel#NumCyan     { font-family: $font_mono; font-size: $fs_body; color: $cyan; }

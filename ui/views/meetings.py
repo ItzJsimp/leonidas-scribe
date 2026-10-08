@@ -504,8 +504,7 @@ class MeetingCard(QFrame):
         v = QVBoxLayout(self)
         v.setContentsMargins(16, 12, 16, 12)
         v.setSpacing(8)
-        mono = title.lower().endswith((".m4a", ".mp3", ".wav", ".flac", ".ogg"))
-        self.lbl_title = ClampLabel(title, 2, "CardTitleMono" if mono else "CardTitle")
+        self.lbl_title = ClampLabel(title, 2, "CardTitle")  # one face: mixed line heights broke the card baselines
         v.addWidget(self.lbl_title)
         v.addWidget(_label(" · ".join(x for x in (fmt_card_date(m.get("started")), fmt_length(m["duration_s"])) if x),
                            "Meta", "Date and length"))
