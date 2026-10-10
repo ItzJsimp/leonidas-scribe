@@ -1397,6 +1397,66 @@ class MeetingPillWidget(QFrame):
         super().leaveEvent(e)
 
 
+class MeetingEndCard(QFrame):
+    """Island-style confirmation after End: 'saved, transcribing' turns into 'notes ready' with Open."""
+    open_clicked = Signal()
+    closed = Signal()
+    DISMISS_MS = 8000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PillIsland")
+        self.state = "saving"
+        h = QHBoxLayout(self)
+        h.setContentsMargins(12, 6, 8, 6)
+        h.setSpacing(8)
+        self.dot = QLabel()
+        self.dot.setObjectName("RecDot")
+        self.dot.setFixedSize(10, 10)
+        h.addWidget(self.dot)
+        self.lbl = _label("", "Body")
+        h.addWidget(self.lbl, 1)
+        self.btn_open = button("Open", "AccentBtn", None, "Open the meeting notes")
+        self.btn_open.clicked.connect(self.open_clicked.emit)
+        h.addWidget(self.btn_open)
+        self.btn_close = icon_button("close", "", "Dismiss", "PillBtn")
+        self.btn_close.clicked.connect(self.closed.emit)
+        h.addWidget(self.btn_close)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.closed.emit)
+        self.setFixedWidth(360)
+
+    def set_state(self, state: str, title: str = ""):
+        """saving | ready | needs_key | failed. Only the finished states auto-dismiss."""
+        self.state = state
+        name = title or "Meeting"
+        text, dot, tip = {
+            "saving": (f"Saved, transcribing: {name}", "saving", "The note appears here when it is ready"),
+            "ready": (f"Notes ready: {name}", "ready", name),
+            "needs_key": ("Saved. Needs a Groq key", "paused", "Add a Groq key in Settings, Models, to transcribe"),
+            "failed": ("Saved. Will retry later", "dead", "Transcription failed; it retries on the next start"),
+        }.get(state, (f"Saved: {name}", "ready", name))
+        room = self.width() - 64 - (0 if state == "saving" else 76)  # dot, close, margins; Open
+        self.lbl.setText(self.lbl.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, room))
+        self.lbl.setToolTip(tip)
+        _repolish(self.dot, state=dot)
+        self.btn_open.setVisible(state != "saving")
+        self.timer.stop()
+        if state != "saving":
+            self.timer.start(self.DISMISS_MS)
+        self.adjustSize()
+
+    def enterEvent(self, e):
+        self.timer.stop()  # reading it: hold
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        if self.state != "saving":
+            self.timer.start(self.DISMISS_MS)
+        super().leaveEvent(e)
+
+
 class _FloatingHost(QWidget):
     """Frameless, non-activating, always-on-top window that carries a pill or toast."""
 
@@ -1497,6 +1557,8 @@ class MeetingsView(QWidget):
         self._rec_title = ""
         self._prompt = None
         self._pill_host = None
+        self._end_host = None
+        self._pending_open = None
         self._recovery_toasted = set()
 
         outer = QVBoxLayout(self)
@@ -1642,6 +1704,9 @@ class MeetingsView(QWidget):
                 self._recovery_toasted.add(r["meeting_dir"])
                 self.host.toast(r["message"], "warn", "Resume", lambda d=r["meeting_dir"]: self.resume(d), ms=15000)
         self._render()
+        if self._pending_open and self._find(self._pending_open):
+            self.open_sheet(self._pending_open)
+            self._pending_open = None
         if self.selected:
             m = self._find(self.selected)
             if m is None:
@@ -2247,13 +2312,57 @@ class MeetingsView(QWidget):
         if not mdir:
             return
         self._release()
-        self.host.toast(f"Stopped. Finishing {title}…", "info")
+        self._show_end_card(mdir, title)
 
         def job():
             mr.stop_worker(mdir)
             return finalize_meeting(mdir, me)
-        self._async(job, lambda res: (self._finished_toast(title, res), self.refresh()),
-                    "Could not finish the meeting")
+        self._async(job, lambda res: self._finished(mdir, title, res), "Could not finish the meeting")
+
+    def _finished(self, mdir: str, title: str, res):
+        self._finished_toast(title, res)
+        card = self._end_host.child if self._end_host is not None else None
+        if card is not None and card.property("mdir") == mdir:
+            card.set_state((res or {}).get("state") if (res or {}).get("state") in ("needs_key", "failed") else "ready", title)
+            self._place_end_card()
+        self.refresh()
+
+    # ----- end-of-meeting card ----------------------------------------------
+    def _show_end_card(self, mdir: str, title: str):
+        """Shown synchronously on End, at the pill's spot, so the click never looks like a vanish."""
+        if self._end_host is None:
+            card = MeetingEndCard()
+            card.open_clicked.connect(lambda: self._open_from_card(card.property("mdir")))
+            card.closed.connect(self._dismiss_end_card)
+            self._end_host = _FloatingHost(card)
+        card = self._end_host.child
+        card.setProperty("mdir", mdir)
+        card.set_state("saving", title)
+        self._place_end_card()
+        self._end_host.show()
+
+    def _place_end_card(self):
+        host = self._end_host
+        host.adjustSize()
+        scr = (self.window().screen() or QApplication.primaryScreen()).availableGeometry()
+        host.move(scr.center().x() - host.width() // 2, scr.top() + 12)
+
+    def _dismiss_end_card(self):
+        if self._end_host is not None:
+            self._end_host.child.timer.stop()
+            self._end_host.hide()
+
+    def _open_from_card(self, mdir):
+        self._dismiss_end_card()
+        if hasattr(self.host, "show_dashboard"):
+            self.host.show_dashboard()
+        if hasattr(self.host, "select_view"):
+            self.host.select_view(self)
+        if mdir and self._find(mdir):
+            self.open_sheet(mdir)
+        elif mdir:
+            self._pending_open = mdir
+            self.refresh()
 
     def _finished_toast(self, title: str, res):
         state = (res or {}).get("state")
@@ -2283,11 +2392,11 @@ class MeetingsView(QWidget):
         self._async(job, started, "Could not resume")
 
     def decline(self, mdir: str):
-        me = self._user_name()
+        me, title = self._user_name(), self._rec_title or "The recording"
         self._release()
+        self._show_end_card(mdir, title)
         self._async(lambda: mr.decline_resume(mdir, pipeline_fn=lambda d: finalize_meeting(d, me)),
-                    lambda res: (self._finished_toast("The recording", res), self.refresh()),
-                    "Could not finish the meeting")
+                    lambda res: self._finished(mdir, title, res), "Could not finish the meeting")
 
     def pill(self) -> MeetingPillWidget:
         if self._pill_host is None:

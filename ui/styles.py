@@ -315,6 +315,8 @@ QLabel#BulletDot { background-color: $cyan; border-radius: 2px; }
 QLabel#RecDot { background-color: $crimson_text; border-radius: 5px; }
 QLabel#RecDot[state="paused"] { background-color: $gold; }
 QLabel#RecDot[state="dead"]   { background-color: $error; }
+QLabel#RecDot[state="saving"] { background-color: $gold; }
+QLabel#RecDot[state="ready"]  { background-color: $success; }
 QLabel#AskQuestion {
     font-size: $fs_body; color: $ink; background-color: $obsidian_800;
     border-radius: $r_control; padding: 6px 10px;
