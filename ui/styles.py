@@ -262,6 +262,8 @@ QFrame#StatusBlock {
     border: 1px solid $hairline;
     border-radius: $r_control;
 }
+QWidget#SheetGrip { background: transparent; }
+QWidget#SheetGrip:hover { background-color: $obsidian_600; }
 QFrame#SideSheet {
     background-color: $obsidian_900;
     border: none;

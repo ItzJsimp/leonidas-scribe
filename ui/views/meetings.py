@@ -959,11 +959,42 @@ class AskBox(QFrame):
 # ---------------------------------------------------------------------------
 # Side sheet (v2 A base + v2 C player) and overlay (v2 A frame + v2 B body)
 # ---------------------------------------------------------------------------
+class _SheetGrip(QWidget):
+    """The sheet's left edge: drag it left to widen the panel, right to narrow it."""
+
+    def __init__(self, sheet):
+        super().__init__(sheet)
+        self.setObjectName("SheetGrip")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setToolTip("Drag to resize the panel")
+        self.sheet = sheet
+        self._from = None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._from = (e.globalPosition().x(), self.sheet.width())
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._from is not None:
+            x0, w0 = self._from
+            self.sheet.view.set_sheet_width(int(w0 + (x0 - e.globalPosition().x())))
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if self._from is not None:
+            self._from = None
+            self.sheet.view.save_sheet_width()
+            e.accept()
+
+
 class SideSheetWidget(QFrame):
     def __init__(self, view, parent=None):
         super().__init__(parent)
         self.setObjectName("SideSheet")
         self.view = view
+        self.grip = _SheetGrip(self)
         self.m = {}
         self._loading = False
         root = QVBoxLayout(self)
@@ -1064,6 +1095,11 @@ class SideSheetWidget(QFrame):
         self.ask = AskBox(view, "Ask about this meeting")
         root.addWidget(self.ask)
         self.rows, self._lit = [], None
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.grip.setGeometry(0, 0, 6, self.height())
+        self.grip.raise_()
 
     def load(self, m: dict):
         self._loading = True
@@ -1539,6 +1575,9 @@ class MeetingsView(QWidget):
     FILTERS = (("all", "All", "Every meeting"), ("pinned", "Pinned", "Meetings whose audio is kept forever"),
                ("notsaved", "Not saved", "Meetings only in Scribe, not yet written to a folder"))
     CARD_MIN = 220
+    SHEET_DEFAULT_W = 520   # was 380-460; the user wanted it a bit wider (2026-10-09)
+    SHEET_MIN_W = 380
+    LIST_MIN_W = 420        # rail plus one card column stays clickable beside the sheet
 
     def __init__(self, host):
         super().__init__()
@@ -1559,6 +1598,7 @@ class MeetingsView(QWidget):
         self._pill_host = None
         self._end_host = None
         self._pending_open = None
+        self._sheet_w = None  # set by dragging the sheet edge; else config meetings.sheet_width
         self._recovery_toasted = set()
 
         outer = QVBoxLayout(self)
@@ -1810,7 +1850,8 @@ class MeetingsView(QWidget):
     def _place_panels(self):
         layer = self.sheet.parentWidget() or self
         w, h = layer.width(), layer.height()
-        sw = min(460, max(380, self.width() // 2))
+        want = self._sheet_w or int(self._cfg().get("sheet_width") or self.SHEET_DEFAULT_W)
+        sw = max(self.SHEET_MIN_W, min(want, w - self.LIST_MIN_W))  # the list keeps room to click
         self.sheet.setGeometry(w - sw, 0, sw, h)
         self.scrim.setGeometry(0, 0, w, h)
         fw = min(1040, w - 64)
@@ -2421,18 +2462,30 @@ class MeetingsView(QWidget):
         host.show()
 
     def _remember_pin(self, on: bool):
+        self._remember("pill_pinned", on)
+
+    def _remember(self, key: str, value):
+        """One meetings.* value into the live config and config.json, off the GUI thread."""
         ctl = getattr(self.host, "controller", None)
         cfg = getattr(self.host, "config", None)
         if cfg is not None:
-            cfg.setdefault("meetings", {})["pill_pinned"] = on
+            cfg.setdefault("meetings", {})[key] = value
         if ctl is None:
             return
 
         def job():
             fresh = ctl.load_config()
-            fresh.setdefault("meetings", {})["pill_pinned"] = on
+            fresh.setdefault("meetings", {})[key] = value
             return ctl.save_config(fresh)
         self._async(job, lambda _: None)
+
+    # ----- side sheet width ----------------------------------------------------
+    def set_sheet_width(self, w: int):
+        self._sheet_w = max(self.SHEET_MIN_W, int(w))
+        self._place_panels()
+
+    def save_sheet_width(self):
+        self._remember("sheet_width", self.sheet.width())
 
     def _pill_missed(self):
         if self.rec_dir:
