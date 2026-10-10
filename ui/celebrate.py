@@ -21,7 +21,7 @@ from .styles import T, FONT_DISPLAY, FONT_SANS, FONT_MONO
 
 W, H = 1040, 760          # overlay size; the pill anchor sits at the bottom middle
 CONFETTI = ("crimson", "cyan", "gold", "success", "white", "gold")
-DURATION_MS = {0: 1300, 1: 2400, 2: 3200, 3: 4200}
+DURATION_MS = {0: 1100, 1: 2400, 2: 3200, 3: 4200}
 PARTICLES = {0: 0, 1: 46, 2: 110, 3: 220}
 SOUND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sounds", "success.wav")
 
@@ -145,24 +145,17 @@ class CelebrationOverlay(QWidget):
         p.end()
 
     def _paint_xp(self, p: QPainter, t: float):
+        # subtle by request (2026-10-09): small, no box, off to the pill's right, short drift and fade
         a = self.anchor()
-        rise = 70 * (1 - (1 - t) ** 3)
-        y = a.y() + (rise + 24 if self.top else -rise - 24)
-        p.setOpacity(min(1.0, t * 6) * (1.0 if t < 0.6 else max(0.0, (1 - t) / 0.4)))
+        rise = 16 * (1 - (1 - t) ** 3)
+        y = a.y() + (rise + 6 if self.top else -rise - 6)
+        p.setOpacity(0.8 * min(1.0, t * 8) * (1.0 if t < 0.55 else max(0.0, (1 - t) / 0.45)))
         deep = bool(self.ev.get("body"))
-        f = QFont(FONT_MONO, 15 if deep else 13)
-        f.setWeight(QFont.Weight.Bold)
+        f = QFont(FONT_MONO, 9)
+        f.setWeight(QFont.Weight.DemiBold)
         p.setFont(f)
-        text = self.ev["title"] + (f"  ·  {self.ev['body']}" if deep else "")
-        r = p.fontMetrics().boundingRect(text)
-        box = QRectF(a.x() - r.width() / 2 - 12, y - 16, r.width() + 24, 32)
-        p.setPen(Qt.PenStyle.NoPen)
-        bg = QColor(T["obsidian_900"])
-        bg.setAlphaF(0.88)
-        p.setBrush(bg)
-        p.drawRoundedRect(box, 16, 16)
-        p.setPen(QColor(T["gold"] if deep else T["cyan"]))
-        p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        p.setPen(QColor(T["gold"] if deep else T["ink_muted"]))
+        p.drawText(QPointF(a.x() + 150, y), self.ev["title"])
 
     def _paint_banner(self, p: QPainter, t: float, fade: float):
         ev = self.ev

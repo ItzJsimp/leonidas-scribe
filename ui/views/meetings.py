@@ -29,7 +29,7 @@ import meeting_store as mst
 import meeting_speakers as msp
 import meeting_detector as mdt
 import meeting_pipeline as mp
-from .. import motion
+from .. import motion, float_stack
 from ..icons import glyph_icon, create_app_icon_pixmap
 from ..styles import T, DARK_STYLESHEET
 from ..widgets import (
@@ -1332,11 +1332,15 @@ class MeetingPillWidget(QFrame):
         self.panel.setVisible(s == "panel" and not dead)
         self.btn_arrow.setIcon(glyph_icon("chevron_left" if self.pinned else "chevron_right", 14, T["ink_muted"]))
         self.btn_arrow.setToolTip("Collapse to the island" if self.pinned else "Pin open as a capsule")
+        win = self.window()
+        # the host is centred once on show; keep that centre x so hover growth is symmetric
+        cx = win.x() + win.width() // 2 if win is not self and win.isVisible() else None
         self.setFixedWidth(520 if dead else {"island": 180, "capsule": 620}.get(s, 400))
         self.adjustSize()
-        win = self.window()
         if win is not self:
             win.adjustSize()
+            if cx is not None:
+                win.move(cx - win.width() // 2, win.y())
 
     def set_status(self, elapsed_s: float, levels: dict, paused: bool, them_label: str = "Them"):
         self.dead = False
@@ -1417,9 +1421,9 @@ class CallPromptToast(QFrame):
     def __init__(self, place: str, destinations: list, destination=None, parent=None):
         super().__init__(parent)
         self.setObjectName("CallPromptToast")
-        self.setFixedWidth(400)
+        self.setFixedWidth(320)  # 20% narrower (was 400)
         v = QVBoxLayout(self)
-        v.setContentsMargins(16, 12, 16, 16)
+        v.setContentsMargins(13, 10, 13, 13)
         v.setSpacing(8)
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
@@ -2373,9 +2377,7 @@ class MeetingsView(QWidget):
         toast.not_now_clicked.connect(self.dismiss_call_prompt)
         toast.never_here_clicked.connect(never)
         host.adjustSize()
-        win = self.window()
-        geo = win.frameGeometry() if win.isVisible() else (win.screen() or QApplication.primaryScreen()).availableGeometry()
-        host.move(geo.right() - host.width() - 24, geo.bottom() - host.height() - 24)
+        float_stack.place(host)  # stacks above the voice card instead of covering it
         host.show()
         self._prompt = host
         QTimer.singleShot(timeout_ms, toast, self.dismiss_call_prompt)

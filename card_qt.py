@@ -30,7 +30,7 @@ def _c(token: str, alpha: int = 255) -> QColor:
 
 def _font(family: str, px: int, weight=QFont.Weight.Normal) -> QFont:
     f = QFont(family)
-    f.setPixelSize(px)
+    f.setPixelSize(max(9, round(px * 0.9)))  # compact card: ~1 px smaller, never below 9 px
     f.setWeight(weight)
     return f
 
@@ -45,7 +45,7 @@ class LeonidasCardWidget(QWidget):
     sig_reply_submitted = Signal(str, str, str)  # (event_id, reply_text, source)
     sig_dismissed = Signal(str)  # (event_id)
 
-    CARD_WIDTH = 460
+    CARD_WIDTH = 368  # 20% narrower (the user, 2026-10-09: cards took too much of the screen edge)
 
     def __init__(self, controller: VoiceController | None = None, parent=None):
         super().__init__(parent)
@@ -77,8 +77,8 @@ class LeonidasCardWidget(QWidget):
 
     def _build_ui(self):
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(18, 16, 18, 16)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(14, 12, 14, 12)
+        root_layout.setSpacing(8)
 
         # Header row: Brand label, Tier pill, and Dismiss button
         header_row = QHBoxLayout()
@@ -224,13 +224,9 @@ class LeonidasCardWidget(QWidget):
         screen = QApplication.primaryScreen()
         if not screen:
             return
-        area = screen.availableGeometry()
         self.adjustSize()
-        card_w = self.width()
-        card_h = self.height()
-        x = area.x() + area.width() - card_w - 24
-        y = area.y() + area.height() - card_h - 48
-        self.move(int(x), int(y))
+        from ui import float_stack
+        float_stack.place(self)  # shares the bottom-right stack with the meetings call prompt
 
     def show_announcement(self, ann: dict):
         """Display an announcement card with actions and reply capability."""

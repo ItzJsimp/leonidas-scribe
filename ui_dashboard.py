@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 import ctypes
+import sys
 import os
 import time
 import threading
@@ -269,6 +270,8 @@ class DashboardWindow(QMainWindow):
         """Runs on every history write, visible or not: diff against what was already celebrated."""
         if not (self.config.get("goals") or {}).get("enabled", True):
             return
+        if os.environ.get("SCRIBE_UI_DEMO") == "1" or "pytest" in sys.modules:
+            return  # render tests and demo shots must never consume or rewrite the real celebration state
 
         def job():
             with self._goals_lock:  # two quick writes must not both celebrate the same level-up
