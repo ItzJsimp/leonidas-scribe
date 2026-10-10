@@ -40,6 +40,29 @@ def list_audio_sessions(exe: str | None = None, timeout: float = 10.0):
         return None
 
 
+def discord_source(sessions) -> dict | None:
+    """Process loopback on Discord when it has a render session (active first), else None.
+    Device loopback only hears the Windows default output; Discord often plays to its own device
+    (2026-10-09: Discord on the headset, the default elsewhere, so the call track was silence)."""
+    found = [s for s in sessions or [] if (s.get("process") or "").lower().replace(".exe", "") == "discord"
+             and s.get("flow") == "render" and int(s.get("pid") or 0) > 0]
+    found.sort(key=lambda s: s.get("state") != "active")
+    if not found:
+        return None
+    return {"kind": "app", "app": "Discord", "pid": int(found[0]["pid"]), "device": None,
+            "render_device": found[0].get("device")}
+
+
+def prefer_call_audio(src: dict, sessions_fn=None) -> dict:
+    """A manual 'computer audio' source becomes Discord process loopback while a Discord call is live."""
+    if src.get("kind") != "device" or (src.get("device") or "default") != "default":
+        return src
+    sessions = (sessions_fn or list_audio_sessions)()
+    live = [s for s in sessions or [] if s.get("state") == "active"]
+    ds = discord_source(live)
+    return {**src, **ds} if ds else src
+
+
 def pid_alive(pid) -> bool:
     if not pid:
         return False
@@ -320,11 +343,7 @@ class MeetingService:
             self._save_config(cfg)
 
     def _discord_source(self):
-        for s in self._sessions() or []:
-            proc = (s.get("process") or "").lower().replace(".exe", "")
-            if proc == "discord" and s.get("flow") == "render" and int(s.get("pid") or 0) > 0:
-                return {"kind": "app", "app": "Discord", "pid": int(s["pid"]), "device": None}
-        return {"kind": "device", "app": "Discord", "pid": None, "device": "default"}
+        return discord_source(self._sessions()) or {"kind": "device", "app": "Discord", "pid": None, "device": "default"}
 
     def _record_discord(self, ev, res):
         local = getattr(self._rpc, "user_id", None)

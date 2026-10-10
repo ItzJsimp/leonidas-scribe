@@ -449,6 +449,7 @@ def run_worker_loop(
 
     cap_proc = None
     mic = None
+    mic_final = []  # the last live mic_ok, so the post-close heartbeats do not report a closed mic as dead
     lvl_me = lvl_them = 0.0
     if not synthetic:
         src = manifest.get("source") or {}
@@ -482,7 +483,7 @@ def run_worker_loop(
                 "them_segments": seg_idx,
                 "last_chunk_time": last_chunk_time,
                 "levels": {"me": round(rms_me, 5), "them": round(rms_them, 5)},
-                "mic_ok": True if mic is None and synthetic else bool(mic and mic.ok),
+                "mic_ok": True if mic is None and synthetic else (mic_final[0] if mic_final else bool(mic and mic.ok)),
                 "heartbeat_at": time.time(),
             },
         )
@@ -547,6 +548,7 @@ def run_worker_loop(
                 time.sleep(block_s - elapsed)
     finally:
         if mic is not None:
+            mic_final.append(mic.ok)
             mic.close()
         if cap_proc is not None:
             try:

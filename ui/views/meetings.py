@@ -2239,7 +2239,8 @@ class MeetingsView(QWidget):
             self.stop_recording()
             return
         box = QMessageBox(QMessageBox.Icon.Question, "Record a meeting",
-                          "Record your mic and the computer's audio as two tracks?\n\nAfter you stop, Groq "
+                          "Record your mic and the call as two tracks? During a Discord call Scribe records "
+                          "Discord itself, whatever device it plays on; otherwise the default speakers.\n\nAfter you stop, Groq "
                           "whisper-large-v3-turbo transcribes it and gpt-oss-120b writes the note: about $0.09 per "
                           "Discord hour, $0.26 for other apps.", QMessageBox.StandardButton.Cancel, self)
         ok = box.addButton("Start recording", QMessageBox.ButtonRole.AcceptRole)
@@ -2269,7 +2270,9 @@ class MeetingsView(QWidget):
         self.btn_record.setEnabled(False)
 
         def job():
-            mr.init_meeting_dir(mdir, title=title, source=src, discord=discord, participants=people,
+            import meeting_service as msvc  # lazy: it lists audio sessions through ScribeCapture
+            source = msvc.prefer_call_audio(src)
+            mr.init_meeting_dir(mdir, title=title, source=source, discord=discord, participants=people,
                                 destination_id=dest, template_id=tmpl)
             _starting(mdir)  # a fresh heartbeat, so the recovery scan never flags a worker still booting
             return mr.start_worker(mdir)

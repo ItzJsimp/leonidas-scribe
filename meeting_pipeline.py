@@ -746,7 +746,60 @@ def _find_destination(cfg: dict, dest_id) -> dict | None:
     return None
 
 
-def finalize_meeting(
+FINALIZE_LOCK = "finalize.lock"
+FINALIZE_WAIT_S = 30 * 60.0
+
+
+def _lock_owner_alive(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            pid = int((f.read().split() or ["0"])[0])
+    except (OSError, ValueError):
+        return True  # being written right now: treat as held
+    if pid == os.getpid():
+        return True
+    from meeting_service import pid_alive  # lazy: meeting_service imports this module
+    return pid_alive(pid)
+
+
+def finalize_meeting(meeting_dir: str, *args, **kwargs) -> dict:
+    """One finalizer per meeting across processes. The worker finalizes after stop and the app also
+    finalizes after stop_worker; on 2026-10-09 both ran at once, so one deleted the FLAC segments the
+    other was reading ("Error opening seg-00043.flac: System error") and both appended every chunk.
+    A second caller now waits for the first and returns the state it left."""
+    lock = os.path.join(meeting_dir, FINALIZE_LOCK)
+    deadline = time.monotonic() + FINALIZE_WAIT_S
+    waited = False
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if not _lock_owner_alive(lock):
+                try:
+                    os.remove(lock)  # the owner crashed: take over
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() > deadline:
+                return {"state": (mr.read_manifest(meeting_dir) or {}).get("state", "processing"), "busy": True}
+            waited = True
+            time.sleep(0.25)
+    try:
+        if waited:  # the other finalizer just finished: report its outcome instead of redoing the work
+            m = mr.read_manifest(meeting_dir) or {}
+            return {"state": m.get("state", "failed"), "error": m.get("error"), "joined": True}
+        os.write(fd, f"{os.getpid()} {time.time():.0f}".encode())
+        return _finalize_meeting_unlocked(meeting_dir, *args, **kwargs)
+    finally:
+        os.close(fd)
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def _finalize_meeting_unlocked(
     meeting_dir: str,
     cfg: dict | None = None,
     store_root: str | None = None,

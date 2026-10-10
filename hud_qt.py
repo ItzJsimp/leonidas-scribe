@@ -731,6 +731,9 @@ class FloatingHUDWidget(QWidget):
         else:
             base = py - 2.0 - travel + 14.0
         painter.setOpacity(alpha * (0.85 if tier == "normal" else 1.0))
+        # it floats over whatever is behind the pill: a 1 px drop shadow lifts it off light pages
+        painter.setPen(QColor(0, 0, 0, 110))
+        painter.drawText(QPointF(x, base + 1.0), text)
         if tier == "exceptional":
             grad = QLinearGradient(x, 0, x + tw, 0)
             hue = (now * 0.35) % 1.0
