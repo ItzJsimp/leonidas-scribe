@@ -85,6 +85,31 @@ class HomeView(QWidget):
         self.lbl_line.setWordWrap(True)
         v.addWidget(self.lbl_line)
 
+        # goal strip: level, today's goal and quests, one click to the Goals page
+        from .goals import Meter
+        self.goal_card, gb = make_card()
+        self.goal_card.setToolTip("Your level and today's goal. Click for quests and achievements.")
+        self.goal_card.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.goal_card.mouseReleaseEvent = lambda _e: host.select_view(host.goals_view)
+        grow = QHBoxLayout()
+        grow.setSpacing(16)
+        self.lbl_level = QLabel("")
+        self.lbl_level.setObjectName("GoalNum")
+        grow.addWidget(self.lbl_level)
+        gcol = QVBoxLayout()
+        gcol.setSpacing(6)
+        self.lbl_goal = QLabel("")
+        self.lbl_goal.setObjectName("Body")
+        self.goal_bar = Meter("cyan", 8)
+        gcol.addWidget(self.lbl_goal)
+        gcol.addWidget(self.goal_bar)
+        grow.addLayout(gcol, 1)
+        open_goals = button("Goals", "LinkBtn", None, "Open quests, ranks and achievements")
+        open_goals.clicked.connect(lambda: host.select_view(host.goals_view))
+        grow.addWidget(open_goals)
+        gb.addLayout(grow)
+        v.addWidget(self.goal_card)
+
         v.addSpacing(4)
         v.addWidget(section_label("Today"))
         row = QHBoxLayout()
@@ -160,13 +185,19 @@ class HomeView(QWidget):
         c = self.host.controller
         saved = c.time_saved() if hasattr(c, "time_saved") else None
         return (c.load_insights(), c.load_history(limit=3, exclude_modes=["preset_transform"]),
-                voice_profile.latest(), saved)
+                voice_profile.latest(), saved, self.host.goals_snapshot())
 
     def _apply(self, result):
         if isinstance(result, Exception):
             self.host.toast(f"Could not load Home: {result}", "error")
             return
-        d, latest, report, saved = result
+        d, latest, report, saved, gs = result
+        t = gs["today"]
+        quests = sum(q["done"] for q in gs["quests"])
+        self.lbl_level.setText(f"LV {gs['level']}")
+        self.lbl_goal.setText(f"{gs['rank']}  ·  {t['words']:,} / {t['goal']:,} words today  ·  "
+                              f"{t['deep']} deep prompts  ·  quests {quests}/3  ·  {gs['streak']}-day streak")
+        self.goal_bar.animate_to(t["words"] / max(1, t["goal"]))
         n, w = d["today_transcripts"], d["today_words"]
         self.lbl_line.setText(
             f"{w:,} words across {n} {'dictation' if n == 1 else 'dictations'} today. "

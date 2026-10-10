@@ -1932,7 +1932,7 @@ class MeetingsView(QWidget):
 
     def _new_person(self, m: dict):
         name, ok = QInputDialog.getText(self, "Add a person", "Name (saved to your people list):")
-        name = (name or "").strip().replace("—", "-")
+        name = (name or "").strip().replace("\u2014", "-")
         if ok and name:
             if name not in (self._cfg().get("people") or []):
                 self._update_meetings_cfg(lambda mc: mc.setdefault("people", []).append(name))

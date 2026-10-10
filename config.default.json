@@ -161,5 +161,12 @@
       "client_id": "1549384780116795502",
       "rules": []
     }
+  },
+  "goals": {
+    "enabled": true,
+    "celebrations": true,
+    "xp_popups": true,
+    "sound": true,
+    "daily_words": 0
   }
 }

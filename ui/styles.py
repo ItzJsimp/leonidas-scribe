@@ -201,6 +201,15 @@ QLabel#KpiLabel { font-family: $font_mono; font-size: $fs_label; color: $ink_lab
 QLabel#KpiNote  { font-size: $fs_body; color: $ink_muted; }
 QLabel#Num      { font-family: $font_mono; font-size: $fs_body; color: $ink; }
 
+/* ---------- goals ---------- */
+QLabel#RankTitle { font-family: $font_display; font-size: 34px; font-weight: 800; color: $ink; }
+QLabel#GoalNum   { font-family: $font_mono; font-size: 20px; font-weight: 600; color: $ink; }
+QLabel#GoalXp    { font-family: $font_mono; font-size: $fs_body; font-weight: 600; color: $gold; }
+QFrame#AchTile   { background-color: $obsidian_850; border: 1px solid $hairline; border-radius: $r_card; }
+QFrame#AchTile[unlocked="true"] { background-color: $gold_soft; border: 1px solid $gold_soft; }
+QFrame#QuestRow  { background-color: $obsidian_900; border: 1px solid $hairline; border-radius: $r_control; }
+QFrame#QuestRow[done="true"] { background-color: $success_soft; border: 1px solid $success_soft; }
+
 /* ---------- status badges: soft fill, matching text ---------- */
 QLabel#Badge, QLabel#BadgeCyan, QLabel#BadgeGold, QLabel#BadgeSuccess, QLabel#BadgeError, QLabel#BadgeCrimson {
     font-family: $font_mono; font-size: $fs_micro; font-weight: 600;

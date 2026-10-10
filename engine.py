@@ -77,7 +77,7 @@ def _extract_topic_keywords(text: str, max_terms: int = 8) -> list:
 
 # API keys never live in the git-tracked config.json: they sit in a sibling
 # secrets.json (gitignored by the repo's *secret* rule) and are merged in on load.
-SECRET_KEYS = ("groq_api_key", "groq_api_key_backup", "cerebras_api_key", "gemini_api_key")
+SECRET_KEYS = ("groq_api_key", "groq_api_key_backup", "cerebras_api_key", "gemini_api_key", "openrouter_api_key")
 
 
 def _secrets_path(config_path: str) -> str:

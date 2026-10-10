@@ -17,6 +17,7 @@ __pycache__/
 macro_suggestions.json
 learned_corrections.json
 .audit-state.json
+goals_state.json*
 
 # Models download cache
 models/

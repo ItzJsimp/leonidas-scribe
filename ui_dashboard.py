@@ -31,8 +31,11 @@ from ui.views.dictionary import DictionaryView
 from ui.views.voice import VoiceView
 from ui.views.meetings import MeetingsView
 from ui.views.home import HomeView
+from ui.views.goals import GoalsView
+from ui.celebrate import Celebrator
+import goals as goals_engine
 from ui.views.settings import SECTIONS, SettingsView
-from ui.widgets import AudioPlayer, Toast, button, kbd, tab_focus_only, section_label
+from ui.widgets import AudioPlayer, Toast, button, kbd, tab_focus_only, section_label, run_async
 from controllers.voice_controller import VoiceController
 from controllers.dashboard_controller import DashboardController
 
@@ -44,6 +47,7 @@ class DashboardWindow(QMainWindow):
     # the rail, where most desktop apps put it.
     NAV = [
         ("home", "Home"),
+        ("star", "Goals"),
         ("history", "Transcripts"),
         ("refresh", "Transforms"),
         ("chart", "Insights"),
@@ -173,6 +177,9 @@ class DashboardWindow(QMainWindow):
         shell.addStretch(0)
 
         self.home_view = HomeView(self)
+        self.goals_view = GoalsView(self)
+        self.celebrator = Celebrator(lambda: self.config)
+        self._goals_lock = threading.Lock()
         self.history_view = TranscriptsView(
             self, "history", "Transcripts", "Everything dictated on this machine, newest first. Click a card to copy it.",
             "Search every transcript", {"exclude_modes": ["preset_transform"]},
@@ -187,7 +194,7 @@ class DashboardWindow(QMainWindow):
         self.meetings_view = MeetingsView(self)
         self.settings_view = SettingsView(self)
         self.settings_view.dirty_changed.connect(self._on_settings_dirty)
-        for view in (self.home_view, self.history_view, self.transforms_view, self.insights_view,
+        for view in (self.home_view, self.goals_view, self.history_view, self.transforms_view, self.insights_view,
                      self.dictionary_view, self.voice_view, self.meetings_view, self.settings_view):
             self.tabs.addWidget(view)
 
@@ -232,6 +239,7 @@ class DashboardWindow(QMainWindow):
         self._state_timer.setInterval(250)
         self._state_timer.timeout.connect(self._poll_state)
         self._state_timer.start()
+        QTimer.singleShot(4000, self, self.check_goals)  # first run: the welcome; later: anything earned while closed
 
     def toggle_key(self):
         return self._toggle_key()
@@ -247,7 +255,35 @@ class DashboardWindow(QMainWindow):
             self.load_data()
             self.dictionary_view.refresh()
         else:
+            self.check_goals()
             self.refresh_history()
+
+    # ------------------------------------------------------------------
+    # Goals: snapshot for the views, celebrations on every history write
+    # ------------------------------------------------------------------
+    def goals_snapshot(self) -> dict:
+        """Worker-thread safe: replays the cached history parse into the Goals snapshot."""
+        return goals_engine.compute(self.controller._history_rows(), self.config)
+
+    def check_goals(self):
+        """Runs on every history write, visible or not: diff against what was already celebrated."""
+        if not (self.config.get("goals") or {}).get("enabled", True):
+            return
+
+        def job():
+            with self._goals_lock:  # two quick writes must not both celebrate the same level-up
+                snap = self.goals_snapshot()
+                evs = goals_engine.events(goals_engine.load_state(), snap)
+                goals_engine.save_state(goals_engine.state_of(snap))
+                return evs
+
+        def done(evs):
+            if isinstance(evs, Exception) or not evs:
+                return
+            self.celebrator.play(evs)
+            if self.isVisible() and self.tabs.currentWidget() is self.goals_view:
+                self.goals_view.refresh()
+        run_async(job, done)
 
     def notify(self, title: str, message: str):
         """Native Windows notification from the tray icon (alerts, reports)."""
