@@ -250,6 +250,50 @@ def what_did_i_miss(
     return {"answer": summary.replace("\u2014", ", "), "chunks_used": recent}
 
 
+def _live_segments(meeting_dir: str) -> list[dict]:
+    """Mid-call there is no transcript.json yet: read finished chunks so Ask works on the live meeting."""
+    rows = sorted(mp.read_chunks_jsonl(meeting_dir), key=lambda c: float(c.get("t0", 0.0)))
+    return [{"speaker_key": c.get("speaker_key") or ("You" if c.get("track") == "me" else "Them"),
+             "t0": float(c.get("t0", 0.0)), "text": c.get("text") or ""} for c in rows if (c.get("text") or "").strip()]
+
+
+ASK_SYSTEM = ("You answer questions about a meeting from its transcript. Lines are [MM:SS] Speaker: text. "
+              "Be direct and short (bullets for lists). Cite the [MM:SS] of each fact. If the transcript does not "
+              "say, answer 'Not in the transcript.' Never use an em dash.")
+MISSED_SYSTEM = ("The user stepped away from a live meeting. From these recent transcript lines, tell them in second "
+                 "person what they missed in 2-4 short sentences: topics, decisions, anything asked of them. "
+                 "Cite [MM:SS]. Never use an em dash.")
+
+
+def _free_chat(cfg: dict | None):
+    chain = mp.free_chain(cfg if cfg is not None else mp.load_scribe_config())
+    if not chain:
+        return None
+    return lambda system, user: mp._chat(chain, [{"role": "system", "content": system},
+                                                 {"role": "user", "content": user}], timeout=60)
+
+
+def free_ask_fn(cfg: dict | None = None):
+    """llm_fn for ask_meetings over OpenRouter free models; None without an OpenRouter key."""
+    chat = _free_chat(cfg)
+    if chat is None:
+        return None
+
+    def fn(question, passages):
+        ctx = "\n".join(f"[{mst.format_timestamp(p.get('t0', 0.0))}] {p.get('speaker_key') or 'Speaker'}: "
+                        f"{p.get('text', '')}" for p in passages)[:120000]
+        return chat(ASK_SYSTEM, f"Transcript:\n{ctx}\n\nQuestion: {question}")
+    return fn
+
+
+def free_missed_fn(cfg: dict | None = None):
+    """llm_fn for what_did_i_miss over OpenRouter free models; None without an OpenRouter key."""
+    chat = _free_chat(cfg)
+    if chat is None:
+        return None
+    return lambda text, minutes: chat(MISSED_SYSTEM, f"Last {minutes} minutes:\n{text}")
+
+
 def ask_meetings(
     store_root: str,
     question: str,
@@ -258,7 +302,7 @@ def ask_meetings(
     llm_fn=None,
 ) -> dict:
     """Answer questions across 'this_meeting' (<30k tokens full transcript, else FTS) or 'all_meetings' (FTS top 12)."""
-    estimated_usd = 0.001
+    estimated_usd = 0.0  # free OpenRouter models only (free_ask_fn)
     passages = []
     used_full_transcript = False
 
@@ -266,7 +310,7 @@ def ask_meetings(
         manifest = mr.read_manifest(meeting_dir) or {}
         mid = manifest.get("id") or os.path.basename(os.path.abspath(meeting_dir))
         title = manifest.get("title") or mid
-        segs = mr._read_json(os.path.join(meeting_dir, "transcript.json")) or []
+        segs = mr._read_json(os.path.join(meeting_dir, "transcript.json")) or _live_segments(meeting_dir)
         full_text = "\n".join(f"[{mst.format_timestamp(s.get('t0', 0.0))}] {s.get('speaker_key', 'Speaker')}: {s.get('text', '')}" for s in segs)
         approx_tokens = len(full_text) // 4
         if approx_tokens < 30000 and segs:

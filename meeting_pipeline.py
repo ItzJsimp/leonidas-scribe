@@ -209,7 +209,7 @@ def transcribe_chunk_groq(
     api_key: str,
     prompt_vocab: str = "",
     sample_rate: int = SAMPLE_RATE,
-    retries: int = 2,
+    retries: int = 5,
     api_key_backup: str = "",
     post_fn=None,
 ) -> dict:
@@ -268,7 +268,12 @@ def transcribe_chunk_groq(
                         timeout=30,
                     )
                 if resp.status_code == 429 and attempt < retries:
-                    time.sleep(0.5 * (attempt + 1))
+                    # free tier is 20 RPM: finalize bursts ~90 chunks, so wait out the window (paid 2026-10-09: 7 chunks lost)
+                    try:
+                        wait = float(resp.headers.get("retry-after") or "")
+                    except ValueError:
+                        wait = 5.0 * 2 ** attempt
+                    time.sleep(min(60.0, max(1.0, wait)))
                     continue
                 resp.raise_for_status()
                 body = resp.json()
@@ -499,6 +504,27 @@ def _llm_chain(cfg: dict, note: bool = False) -> list[tuple[str, str, str]]:
     return chain
 
 
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+FREE_ASK_MODELS = (
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+    "thinkingmachines/inkling:free",
+    "openrouter/free",
+)
+
+
+def is_free_model(model: str) -> bool:
+    return model.endswith(":free") or model == "openrouter/free"
+
+
+def free_chain(cfg: dict) -> list[tuple[str, str, str]]:
+    """OpenRouter free models only (meetings.ask_models overrides the order). A paid id is dropped, never called."""
+    api = (cfg or {}).get("api") or {}
+    key = api.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY") or ""
+    models = ((cfg or {}).get("meetings") or {}).get("ask_models") or FREE_ASK_MODELS
+    return [(OPENROUTER_URL, key, m) for m in models if key and is_free_model(m)]
+
+
 def _chat(chain, messages, json_mode: bool = False, timeout: float = 90, post=None) -> str:
     post = post or requests.post
     last = None
@@ -511,7 +537,10 @@ def _chat(chain, messages, json_mode: bool = False, timeout: float = 90, post=No
             if r.status_code >= 400:
                 last = f"HTTP {r.status_code}"
                 continue
-            return r.json()["choices"][0]["message"]["content"] or ""
+            out = r.json()["choices"][0]["message"]["content"] or ""
+            if out.strip():
+                return out
+            last = f"{model}: empty reply"
         except Exception as e:
             last = e
     raise RuntimeError(f"LLM chain failed: {last}")
@@ -607,8 +636,9 @@ def _transcribe_missing(meeting_dir: str, stt, sample_rate: int = SAMPLE_RATE) -
                 return
             try:
                 res = stt(pcm, t0, t1, track)
-            except Exception:
+            except Exception as e:
                 failed[0] += 1
+                _patch_manifest(meeting_dir, last_stt_error=str(e)[:200])
                 return
             append_chunk_jsonl(meeting_dir, {"track": track, "t0": t0, "t1": t1, "text": res.get("text", ""), "words": res.get("words", [])})
 
@@ -776,6 +806,8 @@ def finalize_meeting(
                 _patch_manifest(meeting_dir, state="failed" if key else "needs_key", error=f"note: {e}"[:300])
                 return {"state": "failed" if key else "needs_key", "error": str(e)}
         manifest = mr.read_manifest(meeting_dir) or manifest
+        if re.match(r"Meeting \w{3} \d{1,2}, \d", manifest.get("title") or "") and note_data.get("title", "").strip():
+            manifest = _patch_manifest(meeting_dir, title=note_data["title"].strip())  # auto title -> AI title
         dest = _find_destination(cfg, manifest.get("destination_id"))
         saved = manifest.get("note_path")
         if dest and not (saved and os.path.exists(saved)):

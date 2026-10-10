@@ -27,6 +27,8 @@ GLYPH = {
     "clock":     "\uE823",
     "expand":    "\uE740",
     "pin":       "\uE718",
+    "star":      "\uE734",
+    "star_fill": "\uE735",
     "send":      "\uE724",
     "upload":    "\uE898",
     "stop":      "\uE71A",

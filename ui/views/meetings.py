@@ -21,7 +21,7 @@ from PySide6.QtGui import QColor, QPainter, QKeySequence, QShortcut, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSlider,
     QFrame, QStackedWidget, QButtonGroup, QInputDialog, QGridLayout, QSizePolicy, QMessageBox,
-    QFileDialog, QDateTimeEdit, QAbstractSpinBox, QApplication,
+    QFileDialog, QDateTimeEdit, QAbstractSpinBox, QApplication, QMenu, QStyle,
 )
 
 import meeting_recorder as mr
@@ -39,8 +39,9 @@ from ..widgets import (
 SCRIBE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TEMPLATES_DIR = os.path.join(SCRIBE_DIR, "meeting_templates")
 HEARTBEAT_DEAD_S = 10.0
-SPEEDS = (1.0, 1.25, 1.5, 2.0)
-ASK_EST = "~$0.001"
+SPEEDS = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+ASK_EST = "Free"
+BROWSE = "__browse__"
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,7 @@ def list_templates() -> list:
                     elif line.startswith("name:"):
                         name = line[5:].strip()
                 out.append((tid, name))
+    out.sort(key=lambda t: t[0] != "default")
     return out or [("default", "Default meeting note")]
 
 
@@ -565,6 +567,16 @@ class MeetingCard(QFrame):
 # ---------------------------------------------------------------------------
 # Audio player (QtMultimedia: seek and pitch-kept speed are native)
 # ---------------------------------------------------------------------------
+class SeekSlider(QSlider):
+    """Click anywhere on the bar to jump there (stock QSlider only page-steps), then drag."""
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.width() > 0:
+            self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                                         int(e.position().x()), self.width()))
+        super().mousePressEvent(e)
+
+
 class MeetingPlayer(QFrame):
     position_changed = Signal(float)
 
@@ -573,7 +585,7 @@ class MeetingPlayer(QFrame):
         self.setObjectName("PlayerBar")
         self._players = []
         self._files = []
-        self._speed = 0
+        self._speed = SPEEDS.index(1.0)
         self._dragging = False
         self._duration = 0.0
         h = QHBoxLayout(self)
@@ -587,9 +599,9 @@ class MeetingPlayer(QFrame):
         h.addWidget(self.btn_back)
         self.lbl_pos = _label("00:00", "NumCyan", "Current position")
         h.addWidget(self.lbl_pos)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = SeekSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
-        self.slider.setToolTip("Drag to scrub")
+        self.slider.setToolTip("Click or drag to jump to any point")
         self.slider.setAccessibleName("Audio position")
         self.slider.sliderPressed.connect(lambda: setattr(self, "_dragging", True))
         self.slider.sliderReleased.connect(self._released)
@@ -597,9 +609,13 @@ class MeetingPlayer(QFrame):
         h.addWidget(self.slider, 1)
         self.lbl_total = _label("00:00", "Meta", "Length")
         h.addWidget(self.lbl_total)
-        self.btn_speed = button("1x", "GhostBtn", None, "Playback speed: click to cycle 1x, 1.25x, 1.5x, 2x")
-        self.btn_speed.setMinimumHeight(28)
-        self.btn_speed.clicked.connect(self._cycle_speed)
+        self.btn_speed = QComboBox()
+        for s in SPEEDS:
+            self.btn_speed.addItem(f"{s:g}x", s)
+        self.btn_speed.setCurrentIndex(self._speed)
+        self.btn_speed.setToolTip("Playback speed (pitch stays natural)")
+        self.btn_speed.setAccessibleName("Playback speed")
+        self.btn_speed.currentIndexChanged.connect(self._set_speed)
         h.addWidget(self.btn_speed)
         self._tick = QTimer(self)
         self._tick.setInterval(250)
@@ -692,12 +708,10 @@ class MeetingPlayer(QFrame):
         self._dragging = False
         self.seek(self.slider.value() / 1000 * self._duration, play=None)
 
-    def _cycle_speed(self):
-        self._speed = (self._speed + 1) % len(SPEEDS)
-        s = SPEEDS[self._speed]
-        self.btn_speed.setText(f"{s:g}x")
+    def _set_speed(self, i: int):
+        self._speed = max(0, i)
         for pl in self._players:
-            pl.setPlaybackRate(s)
+            pl.setPlaybackRate(SPEEDS[self._speed])
 
     def _show(self, t: float):
         self.lbl_pos.setText(mst.format_timestamp(t))
@@ -870,14 +884,14 @@ class AskBox(QFrame):
         chips = QHBoxLayout()
         chips.setSpacing(6)
         self.btn_missed = button("What did I miss?", "ChipBtn", None,
-                                 "Recap the last 5 minutes from finished chunks (free, runs on this PC)")
+                                 "Recap the last 5 minutes of the live transcript (free OpenRouter model)")
         self.btn_missed.clicked.connect(self._missed)
         chips.addWidget(self.btn_missed)
         self.btn_actions = button("Action items", "ChipBtn", None, f"Ask for the action items ({ASK_EST})")
         self.btn_actions.clicked.connect(lambda: self._ask("What are the action items?"))
         chips.addWidget(self.btn_actions)
         chips.addStretch(1)
-        self.lbl_cost = _badge(ASK_EST, "", "Estimated cost of one question (Groq gpt-oss-120b)")
+        self.lbl_cost = _badge(ASK_EST, "", "Ask uses free OpenRouter models only, never a paid one")
         chips.addWidget(self.lbl_cost)
         v.addLayout(chips)
 
@@ -934,7 +948,7 @@ class AskBox(QFrame):
             return
         self.lbl_a.setText((res.get("answer") or "No matching passages found.").replace("\u2014", ", "))
         usd = res.get("estimated_usd")
-        self.lbl_cost.setText(f"${usd:.3f} est." if usd else "$0.00")
+        self.lbl_cost.setText(f"${usd:.3f} est." if usd else ASK_EST)
         same = self.meeting.get("id")
         for c in (res.get("citations") or [])[:3]:
             if c.get("meeting_id") == same:
@@ -986,9 +1000,10 @@ class SideSheetWidget(QFrame):
         props.setVerticalSpacing(4)
         self.in_date = QDateTimeEdit()
         self.in_date.setDisplayFormat("MMM d, yyyy  h:mm AP")
-        self.in_date.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.in_date.setToolTip("When the meeting started. Type to change it, then press Enter.")
+        self.in_date.setCalendarPopup(True)
+        self.in_date.setToolTip("When the meeting started. Click the arrow for a calendar; click the time to type it.")
         self.in_date.editingFinished.connect(self._date_done)
+        self.in_date.calendarWidget().clicked.connect(lambda _d: QTimer.singleShot(0, self._date_done))
         self.lbl_len = _label("", "Num", "Length (from the recording)")
         self.people = QHBoxLayout()
         self.people.setSpacing(4)
@@ -996,13 +1011,22 @@ class SideSheetWidget(QFrame):
         people_w.setLayout(self.people)
         self.people.setContentsMargins(0, 0, 0, 0)
         self.cb_dest = QComboBox()
-        self.cb_dest.setToolTip("Pick a folder to write the note and transcript there. Picking is your OK to write.")
+        self.cb_dest.setToolTip("Pick a folder to write the note and transcript there, or Browse for any folder. "
+                                "Picking is your OK to write.")
         self.cb_dest.activated.connect(self._dest_picked)
+        self.btn_fav = icon_button("star", "", "Favorite this folder: it stays at the top of the list")
+        self.btn_fav.clicked.connect(lambda: view.toggle_favorite(self.cb_dest.currentData()))
+        dest_w = QWidget()
+        dh = QHBoxLayout(dest_w)
+        dh.setContentsMargins(0, 0, 0, 0)
+        dh.setSpacing(4)
+        dh.addWidget(self.cb_dest, 1)
+        dh.addWidget(self.btn_fav)
         self.cb_tmpl = QComboBox()
         self.cb_tmpl.setToolTip("Note layout. A change applies the next time the note is generated.")
         self.cb_tmpl.activated.connect(self._tmpl_picked)
         for r, (g, name, w) in enumerate((("calendar", "Date", self.in_date), ("clock", "Length", self.lbl_len),
-                                          ("people", "People", people_w), ("folder", "Saved to", self.cb_dest),
+                                          ("people", "People", people_w), ("folder", "Saved to", dest_w),
                                           ("library", "Template", self.cb_tmpl))):
             props.addWidget(_icon_label(g, name), r, 0)
             props.addWidget(w, r, 1)
@@ -1060,10 +1084,14 @@ class SideSheetWidget(QFrame):
             chip.setMinimumHeight(26)
             chip.clicked.connect(lambda _=False, n=name: self.view.rename_speaker(self.m, n))
             self.people.addWidget(chip)
+        add = icon_button("add", "", "Add a person: pick someone from past meetings or type a new name")
+        add.clicked.connect(lambda _=False, b=add: self.view.person_menu(self.m, b))
+        self.people.addWidget(add)
         if not m.get("speakers"):
             self.people.addWidget(_label("Nobody named yet", "Helper"))
         self.people.addStretch(1)
         self.view.fill_dest_combo(self.cb_dest, m)
+        self._sync_fav()
         self.view.fill_template_combo(self.cb_tmpl, m)
         fill_summary(self.lay_summary, m, self.view)
         self.rows, self._lit = fill_transcript(self.lay_transcript, m, self.view), None
@@ -1080,6 +1108,14 @@ class SideSheetWidget(QFrame):
 
     def _dest_picked(self, i: int):
         self.view.save_to(self.m, self.cb_dest.itemData(i), self.cb_dest)
+        self._sync_fav()
+
+    def _sync_fav(self):
+        d = self.view._dest(self.cb_dest.currentData())
+        self.btn_fav.setEnabled(bool(d))
+        on = bool(d and d.get("pinned"))
+        self.btn_fav.setIcon(glyph_icon("star_fill" if on else "star", 14, T["gold"] if on else T["ink_muted"]))
+        self.btn_fav.setToolTip("Unfavorite this folder" if on else "Favorite this folder: it stays at the top of the list")
 
     def _tmpl_picked(self, i: int):
         self.view.set_template(self.m, self.cb_tmpl.itemData(i))
@@ -1214,7 +1250,7 @@ class MeetingPillWidget(QFrame):
         self.btn_stop = icon_button("stop", "", "Stop and save the meeting", "PillBtn")
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
         self.btn_missed_inline = button("What did I miss?", "AccentBtn", "undo",
-                                        "Recap the last 5 minutes (free, runs on this PC)")
+                                        "Recap the last 5 minutes (free OpenRouter model)")
         self.btn_missed_inline.clicked.connect(self.missed_clicked.emit)
         self.btn_resume = button("Resume", "", "play", "Resume recording this call (the gap is noted)")
         self.btn_resume.clicked.connect(self.resume_clicked.emit)
@@ -1231,7 +1267,7 @@ class MeetingPillWidget(QFrame):
         pv.setContentsMargins(0, 0, 4, 4)
         pv.setSpacing(8)
         pv.addWidget(self._meters(2))
-        self.btn_missed = button("What did I miss?", "AccentBtn", "undo", "Recap the last 5 minutes (free, runs on this PC)")
+        self.btn_missed = button("What did I miss?", "AccentBtn", "undo", "Recap the last 5 minutes (free OpenRouter model)")
         self.btn_missed.clicked.connect(self.missed_clicked.emit)
         pv.addWidget(self.btn_missed)
         self.answer = QFrame()
@@ -1611,6 +1647,10 @@ class MeetingsView(QWidget):
                 if self.scrim.isVisible():
                     self.overlay.load(m)
 
+    def show_recovery_prompt(self, message, resume_cb, decline_cb=None):
+        """Resume toast for a crashed recording found by meeting_service (same toast the 10 s scan uses)."""
+        self.host.toast(message, "warn", "Resume", resume_cb, ms=15000)  # ponytail: no Decline button, toast expiry leaves it needs_resume
+
     def _find(self, mdir):
         return next((m for m in self.all_meetings if m["dir"] == mdir), None)
 
@@ -1815,13 +1855,100 @@ class MeetingsView(QWidget):
         cb.blockSignals(True)
         cb.clear()
         cb.addItem(glyph_icon("folder", 14, T["ink_muted"]), "Not saved", None)
-        for d in self.destinations():
-            cb.addItem(glyph_icon("folder", 14, T["ink_muted"]), d.get("name") or d.get("id"), d.get("id") or d.get("name"))
+        # favorites first, then every folder ever picked; labelled with the real path so it reads as where it lives
+        for d in sorted(self.destinations(), key=lambda d: not d.get("pinned")):
+            fav = bool(d.get("pinned"))
+            cb.addItem(glyph_icon("star_fill" if fav else "folder", 14, T["gold"] if fav else T["ink_muted"]),
+                       d.get("path"), d.get("id") or d.get("name"))
+            cb.setItemData(cb.count() - 1, f"{d.get('name') or d.get('id')}: {d.get('path')}", Qt.ItemDataRole.ToolTipRole)
+        cb.addItem(glyph_icon("add", 14, T["cyan"]), "Browse for a folder…", BROWSE)
         i = cb.findData(m.get("destination_id"))
         cb.setCurrentIndex(i if i >= 0 else 0)
-        if not self.destinations():
-            cb.setToolTip("No destination folders yet. Add one in Settings, Meetings.")
         cb.blockSignals(False)
+
+    def _update_meetings_cfg(self, mutate):
+        """Apply mutate(meetings_cfg) to the live config and to config.json (fresh read, so other edits survive)."""
+        cfg = getattr(self.host, "config", None)
+        if cfg is not None:
+            mutate(cfg.setdefault("meetings", {}))
+        ctl = getattr(self.host, "controller", None)
+        if ctl is not None:
+            def job():
+                fresh = ctl.load_config()
+                mutate(fresh.setdefault("meetings", {}))
+                return ctl.save_config(fresh)
+            self._async(job, lambda _: None, "Could not save the folder list")
+
+    def browse_destination(self, m: dict, cb: QComboBox):
+        cur = self._dest(m.get("destination_id"))
+        path = QFileDialog.getExistingDirectory(self, "Save this meeting to a folder", (cur or {}).get("path") or "")
+        if not path:
+            self.fill_dest_combo(cb, m)
+            return
+        path = os.path.normpath(path)
+        known = next((d for d in self.destinations()
+                      if os.path.normcase(os.path.normpath(d["path"])) == os.path.normcase(path)), None)
+        if known is None:
+            known = {"id": path, "name": os.path.basename(path) or path, "path": path, "pinned": False}
+            self._update_meetings_cfg(lambda mc: mc.setdefault("destinations", []).append(dict(known)))
+        self.fill_dest_combo(cb, m)
+        self.save_to(m, known.get("id") or known.get("name"), cb)
+
+    def toggle_favorite(self, dest_id):
+        d = self._dest(dest_id)
+        if not d:
+            return
+        on = not d.get("pinned")
+
+        def mutate(mc):
+            for x in mc.get("destinations") or []:
+                if (x.get("id") or x.get("name")) == dest_id:
+                    x["pinned"] = on
+        self._update_meetings_cfg(mutate)
+        self.host.toast(f"{'Favorited' if on else 'Unfavorited'} {d.get('path')}", "success")
+        self.refresh()
+
+    # ----- people -----------------------------------------------------------
+    def known_people(self) -> list:
+        """Saved people plus everyone named in any past meeting, most frequent first."""
+        counts = {}
+        for n in self._cfg().get("people") or []:
+            counts[n] = counts.get(n, 0) + 1000
+        for mm in self.all_meetings:
+            for n in mm.get("speakers") or []:
+                counts[n] = counts.get(n, 0) + 1
+        return [n for n in sorted(counts, key=lambda n: -counts[n])
+                if n not in ("Them", "You", "Me", "Speaker") and not re.fullmatch(r"Speaker \w{1,2}", n)]
+
+    def person_menu(self, m: dict, anchor: QWidget):
+        menu = QMenu(self)
+        have = set(m.get("speakers") or [])
+        for n in [p for p in self.known_people() if p not in have][:20]:
+            menu.addAction(n, lambda n=n: self.add_person(m, n))
+        if not menu.isEmpty():
+            menu.addSeparator()
+        menu.addAction(glyph_icon("add", 14, T["cyan"]), "New person…", lambda: self._new_person(m))
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def _new_person(self, m: dict):
+        name, ok = QInputDialog.getText(self, "Add a person", "Name (saved to your people list):")
+        name = (name or "").strip().replace("—", "-")
+        if ok and name:
+            if name not in (self._cfg().get("people") or []):
+                self._update_meetings_cfg(lambda mc: mc.setdefault("people", []).append(name))
+            self.add_person(m, name)
+
+    def add_person(self, m: dict, name: str):
+        mdir = m["dir"]
+
+        def job():
+            man = mr.read_manifest(mdir) or {}
+            ps = man.get("participants") or []
+            if not any((p.get("name") or p.get("key")) == name for p in ps):
+                ps.append({"key": name, "name": name, "discord_id": None, "avatar_path": None, "manual": True})
+            man["participants"] = ps
+            mr.write_manifest(mdir, man)
+        self._async(job, lambda _: (self.host.toast(f"Added {name}", "success"), self.refresh()), "Could not add")
 
     def fill_template_combo(self, cb: QComboBox, m: dict):
         cb.blockSignals(True)
@@ -1893,6 +2020,9 @@ class MeetingsView(QWidget):
                                     self.refresh()), "Could not rename")
 
     def save_to(self, m: dict, dest_id, cb: QComboBox):
+        if dest_id == BROWSE:
+            self.browse_destination(m, cb)
+            return
         if dest_id is None:
             if m.get("destination_id"):
                 self.fill_dest_combo(cb, m)
@@ -1902,16 +2032,33 @@ class MeetingsView(QWidget):
         if not dest:
             return
         note = m.get("note") or None
-        self.host.toast(f"Saving to {dest.get('name')}…", "info")
+        self.host.toast(f"Saving to {dest.get('path')}…", "info")
         self._async(lambda: mst.save_meeting_to_destination(m["dir"], dest, note), lambda r: (
-            self.host.toast(f"Saved to {dest.get('name')}: {os.path.basename(r['note_path'])}", "success"),
+            self.host.toast(f"Saved to {dest.get('path')}: {os.path.basename(r['note_path'])}", "success"),
             self.refresh()), "Could not save")
 
     def set_template(self, m: dict, tid):
         if not tid or tid == m.get("template_id"):
             return
-        self._async(lambda: set_manifest_field(m["dir"], "template_id", tid), lambda _: (
-            self.host.toast("Template changed. It applies the next time the note is generated.", "success"),
+        mdir, has_note = m["dir"], bool(m.get("note")) and m.get("state") == "ready"
+
+        def job():
+            set_manifest_field(mdir, "template_id", tid)
+            if not has_note:
+                return None
+            # rewrite the note with the new template (free Groq); the saved copy is overwritten in place
+            os.replace(os.path.join(mdir, "note.json"), os.path.join(mdir, "note.prev.json"))
+            res = mp.finalize_meeting(mdir)
+            man = mr.read_manifest(mdir) or {}
+            dest = self._dest(man.get("destination_id"))
+            if dest and res.get("state") == "ready":
+                mst.save_meeting_to_destination(mdir, dest, mr._read_json(os.path.join(mdir, "note.json")))
+            return res
+        if has_note:
+            self.host.toast("Rewriting the note with the new template…", "info")
+        self._async(job, lambda r: (
+            self.host.toast("Note rewritten with the new template" if r else
+                            "Template changed. It applies when the note is written.", "success"),
             self.refresh()), "Could not change the template")
 
     def accept_tooltip(self, m: dict) -> str:
@@ -1945,12 +2092,20 @@ class MeetingsView(QWidget):
         self._async(job, done, "Could not accept")
 
     # ----- ask --------------------------------------------------------------
+    # Free OpenRouter models only (mp.free_chain drops any paid id). No key: the closest line, labelled as such.
     def ask(self, m: dict, q: str, scope: str, cb):
         root, mdir = self.store_root, m.get("dir")
-        run_async(lambda: mdt.ask_meetings(root, q, scope=scope, meeting_dir=mdir), cb)
+
+        def job():
+            fn = mdt.free_ask_fn()
+            res = mdt.ask_meetings(root, q, scope=scope, meeting_dir=mdir, llm_fn=fn)
+            if fn is None:
+                res["answer"] = "No OpenRouter key (Settings, Models), so here is the closest line: " + res["answer"]
+            return res
+        run_async(job, cb)
 
     def missed(self, mdir: str, cb, minutes: int = 5):
-        run_async(lambda: mdt.what_did_i_miss(mdir, window_minutes=minutes), cb)
+        run_async(lambda: mdt.what_did_i_miss(mdir, window_minutes=minutes, llm_fn=mdt.free_missed_fn()), cb)
 
     # ----- import -----------------------------------------------------------
     def import_audio(self):
