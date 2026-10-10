@@ -9,19 +9,21 @@ Threading (agent-playbook 5b): every disk read, subprocess and worker command ru
 ui.widgets.run_async; callbacks land on the GUI thread, which is the only thread that touches
 widgets. Styling lives in ui/styles.py (object names + [property] selectors, no inline sheets).
 """
+import collections
 import datetime
+import math
 import os
 import re
 import shutil
 import tempfile
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer, QRect, QUrl, QDateTime, QPoint
-from PySide6.QtGui import QColor, QPainter, QKeySequence, QShortcut, QPixmap
+from PySide6.QtCore import Qt, Signal, QTimer, QRect, QRectF, QPointF, QUrl, QDateTime, QPoint
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QKeySequence, QShortcut, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSlider,
     QFrame, QStackedWidget, QButtonGroup, QInputDialog, QGridLayout, QSizePolicy, QMessageBox,
-    QFileDialog, QDateTimeEdit, QAbstractSpinBox, QApplication, QMenu, QStyle,
+    QFileDialog, QDateTimeEdit, QAbstractSpinBox, QApplication, QMenu, QStyle, QGraphicsOpacityEffect,
 )
 
 import meeting_recorder as mr
@@ -29,7 +31,9 @@ import meeting_store as mst
 import meeting_speakers as msp
 import meeting_detector as mdt
 import meeting_pipeline as mp
+import meeting_share as shr
 from .. import motion, float_stack
+from ..date_popup import DateField
 from ..icons import glyph_icon, create_app_icon_pixmap
 from ..styles import T, DARK_STYLESHEET
 from ..widgets import (
@@ -403,6 +407,7 @@ class ClampLabel(QLabel):
     def __init__(self, text: str, lines: int = 2, obj: str = "CardTitle", fit: bool = False):
         super().__init__()
         self._fit = fit
+        self._eliding = False
         self.setObjectName(obj)
         self.setWordWrap(True)
         self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -426,6 +431,15 @@ class ClampLabel(QLabel):
         return fm.boundingRect(QRect(0, 0, w, 10000), Qt.TextFlag.TextWordWrap, t).height() <= self.height()
 
     def _elide(self):
+        if self._eliding:  # setFixedHeight re-fires resizeEvent: fit mode ping-ponged need <-> h+2 forever
+            return
+        self._eliding = True
+        try:
+            self._elide_now()
+        finally:
+            self._eliding = False
+
+    def _elide_now(self):
         need = self.fontMetrics().lineSpacing() * self._lines + 2  # the QSS font lands at polish, after __init__
         if self.height() != need and not self._fit:
             self.setFixedHeight(need)
@@ -486,31 +500,130 @@ def time_link(t: float, on_seek, tip: str = "") -> QPushButton:
     return b
 
 
-class LevelBars(QWidget):
-    """Rolling audio level: n thin bars, newest on the right. Paint reads T only."""
+def _chase(cur: float, target: float) -> float:
+    """The dictation pill's follow rule (hud_qt._on_anim_frame): fast attack, slow release."""
+    return cur + (target - cur) * (0.55 if target > cur else 0.14)
 
-    def __init__(self, n: int = 6, height: int = 14, parent=None):
+
+class LevelFeed:
+    """Feel of the dictation pill, for a call. The worker publishes dB-scaled 25 ms sub-levels
+    (meeting_recorder.LevelPublisher); each 16 ms frame plays out the sub-level that is due, then
+    chases it with attack 0.55 / release 0.14. Silent (paused, stalled worker, no file) reads zero."""
+    N = 26  # wave history, one sample per 3 frames (~20 a second), like hud_qt.WAVE_BARS
+
+    def __init__(self):
+        self.mdir = None
+        self.reader = None
+        self.fallback = (0.0, 0.0)  # status.json levels (me, them), refreshed by the 2 s poll
+        self.reset()
+
+    def reset(self):
+        self.me = self.them = 0.0
+        self.wave_me = collections.deque([0.0] * self.N, maxlen=self.N)
+        self.wave_them = collections.deque([0.0] * self.N, maxlen=self.N)
+        self.wave_mix = collections.deque([0.0] * self.N, maxlen=self.N)
+        self.tick = 0
+        self._seq = -1
+        self._t_seq = 0.0
+        self._subs = ((0.0,) * 4, (0.0,) * 4)
+
+    def attach(self, mdir):
+        if mdir == self.mdir:
+            return
+        if self.reader is not None:
+            self.reader.close()
+        self.mdir = mdir
+        self.reader = mr.LevelReader(mdir) if mdir else None
+        self.reset()
+
+    @property
+    def dominant(self) -> str:
+        return "me" if self.me >= self.them else "them"
+
+    def _target(self, now: float):
+        got = self.reader.read() if self.reader else None
+        if got and got[0] != self._seq:
+            self._seq, self._subs, self._t_seq = got[0], (got[1], got[2]), now
+        age = now - self._t_seq
+        if self._seq < 0:  # a worker started before levels.bin existed: the coarse status.json peaks, same dB scale
+            return tuple(min(1.0, max(0.0, (20.0 * math.log10(max(v, 1e-9)) + 52.0) / 38.0)) for v in self.fallback)
+        if age > 0.5:
+            return 0.0, 0.0
+        i = min(len(self._subs[0]) - 1, int(age / 0.025))
+        return self._subs[0][i], self._subs[1][i]
+
+    def step(self, silent: bool = False):
+        self.tick += 1
+        tm, tt = (0.0, 0.0) if silent else self._target(time.monotonic())
+        self.me, self.them = _chase(self.me, tm), _chase(self.them, tt)
+        if self.tick % 3 == 0:
+            self.wave_me.append(self.me)
+            self.wave_them.append(self.them)
+            self.wave_mix.append(max(self.me, self.them))
+
+
+class LiveMeter(QWidget):
+    """The dictation pill's 7-bar meter, same maths as hud_qt._paint_listening: newest level in the
+    middle spreading outward. Cyan when you are louder, white when the call is."""
+    BARS = 7
+
+    def __init__(self, feed: LevelFeed, parent=None):
         super().__init__(parent)
-        self._vals = [0.0] * n
-        self.setFixedSize(n * 4, height)
-
-    def push(self, v: float):
-        self._vals = self._vals[1:] + [max(0.0, min(1.0, v))]
-        self.update()
+        self.feed = feed
+        self.setFixedSize(self.BARS * 6 - 3, 24)
 
     def paintEvent(self, e):
         p = QPainter(self)
-        h = self.height()
-        for i, v in enumerate(self._vals):
-            bh = max(2, int(v * h))
-            p.fillRect(i * 4, h - bh, 3, bh, QColor(T["cyan"] if v > 0.04 else T["obsidian_600"]))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        col = QColor(T["cyan"] if self.feed.dominant == "me" else T["ink"])
+        samples = list(self.feed.wave_mix)
+        mid, cy = self.BARS // 2, self.height() / 2.0
+        for i in range(self.BARS):
+            lvl = samples[-1 - abs(i - mid) * 2]
+            bh = 4.0 + min(18.0, lvl * 22.0)
+            col.setAlpha(int(255 * (0.55 + 0.45 * min(1.0, lvl * 1.6))))
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(i * 6.0, cy - bh / 2.0, 3.0, bh), 1.5, 1.5)
         p.end()
 
 
-def _level(rms) -> float:
-    v = float(rms or 0.0)
-    v = v / 32768.0 if v > 1.0 else v
-    return min(1.0, v * 10.0)
+class LiveRibbon(QWidget):
+    """One lane of the hover panel: the last ~1.3 s as a filled ribbon mirrored on its centre line."""
+
+    def __init__(self, feed: LevelFeed, key: str, token: str, parent=None):
+        super().__init__(parent)
+        self.feed, self.key, self.token = feed, key, token
+        self.setFixedHeight(26)
+        self.setMinimumWidth(80)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        samples = list(self.feed.wave_me if self.key == "me" else self.feed.wave_them)
+        w, h = float(self.width()), float(self.height())
+        cy, amp, n = h / 2.0, h / 2.0 - 1.0, len(samples)
+        col = QColor(T[self.token])
+        col.setAlpha(46)
+        p.setPen(QColor(255, 255, 255, 14))
+        p.drawLine(QPointF(0, cy), QPointF(w, cy))
+        top = [QPointF(w * i / (n - 1), cy - max(0.6, v * amp)) for i, v in enumerate(samples)]
+        path = QPainterPath(top[0])
+        for a, b in zip(top, top[1:]):  # midpoint quads: a smooth ribbon, not 26 stairs
+            path.quadTo(a, QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2))
+        path.lineTo(top[-1])
+        for pt in reversed(top):
+            path.lineTo(QPointF(pt.x(), 2 * cy - pt.y()))
+        path.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.fillPath(path, col)
+        edge = QColor(T[self.token])
+        edge.setAlpha(210)
+        p.setPen(edge)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.end()
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +632,11 @@ def _level(rms) -> float:
 class MeetingCard(QFrame):
     """Notion-style card: title (2 lines), date and length, people, one badge, one destination chip."""
     clicked = Signal(str)
+    share_requested = Signal(str, object)  # meeting dir, global position of the right-click
+
+    def contextMenuEvent(self, e):
+        self.share_requested.emit(self.mdir, e.globalPos())
+        e.accept()
 
     def __init__(self, m: dict, dest_names: dict, parent=None):
         super().__init__(parent)
@@ -1041,6 +1159,13 @@ class SideSheetWidget(QFrame):
         self.btn_expand.clicked.connect(view.open_overlay)
         hdr.addWidget(self.btn_expand)
         hdr.addStretch(1)
+        self.btn_resume = button("Continue", "AccentBtn", "mic",
+                                 "Keep recording into this meeting: new audio is added to the end and the transcript and note are rebuilt")
+        self.btn_resume.clicked.connect(lambda: view.continue_meeting(self.m))
+        hdr.addWidget(self.btn_resume)
+        self.btn_share = icon_button("copy", "", "Share this meeting: copy it for an agent, copy the folder, or send it as a page")
+        self.btn_share.clicked.connect(lambda: view.share_menu(self.m, self.btn_share.mapToGlobal(self.btn_share.rect().bottomLeft())))
+        hdr.addWidget(self.btn_share)
         self.btn_pin = icon_button("pin", "", "Pin: keep this meeting's audio forever")
         self.btn_pin.setCheckable(True)
         self.btn_pin.clicked.connect(lambda: view.toggle_pin(self.m))
@@ -1060,12 +1185,9 @@ class SideSheetWidget(QFrame):
         props.setContentsMargins(0, 0, 0, 0)
         props.setHorizontalSpacing(12)
         props.setVerticalSpacing(4)
-        self.in_date = QDateTimeEdit()
-        self.in_date.setDisplayFormat("MMM d, yyyy  h:mm AP")
-        self.in_date.setCalendarPopup(True)
-        self.in_date.setToolTip("When the meeting started. Click the arrow for a calendar; click the time to type it.")
+        self.in_date = DateField()
+        self.in_date.setToolTip("When the meeting started. Click to pick a day and time; nothing changes until you press Set date.")
         self.in_date.editingFinished.connect(self._date_done)
-        self.in_date.calendarWidget().clicked.connect(lambda _d: QTimer.singleShot(0, self._date_done))
         self.lbl_len = _label("", "Num", "Length (from the recording)")
         self.people = QHBoxLayout()
         self.people.setSpacing(4)
@@ -1152,6 +1274,7 @@ class SideSheetWidget(QFrame):
         same = self.m.get("dir") == m.get("dir")
         self.m = m
         self.lbl_title.set_full((m.get("title") or "Untitled meeting").upper())
+        self.btn_resume.setVisible(m.get("state") in ("ready", "failed", "needs_key"))  # not while recording or processing
         self.btn_pin.setChecked(bool(m.get("pinned")))
         self.btn_pin.setIcon(glyph_icon("pin", 14, T["cyan"] if m.get("pinned") else T["ink_muted"]))
         self.btn_pin.setToolTip("Unpin: audio follows retention again" if m.get("pinned")
@@ -1223,6 +1346,12 @@ class OverlayFrameWidget(QFrame):
         self.btn_back.clicked.connect(view.close_overlay)
         top.addWidget(self.btn_back)
         top.addStretch(1)
+        self.btn_resume = button("Continue", "AccentBtn", "mic", "Keep recording into this meeting")
+        self.btn_resume.clicked.connect(lambda: view.continue_meeting(self.m))
+        top.addWidget(self.btn_resume)
+        self.btn_share = icon_button("copy", "", "Share this meeting")
+        self.btn_share.clicked.connect(lambda: view.share_menu(self.m, self.btn_share.mapToGlobal(self.btn_share.rect().bottomLeft())))
+        top.addWidget(self.btn_share)
         self.btn_pin = icon_button("pin", "", "Pin: keep this meeting's audio forever")
         self.btn_pin.clicked.connect(lambda: view.toggle_pin(self.m))
         top.addWidget(self.btn_pin)
@@ -1275,6 +1404,7 @@ class OverlayFrameWidget(QFrame):
         self.lbl_title.set_full((m.get("title") or "Untitled meeting").upper())
         self.lbl_meta.setText(f"{fmt_long_date(m.get('started'))}  ·  {fmt_length(m['duration_s'])}")
         self.btn_pin.setIcon(glyph_icon("pin", 14, T["cyan"] if m.get("pinned") else T["ink_muted"]))
+        self.btn_resume.setVisible(m.get("state") in ("ready", "failed", "needs_key"))
         _clear(self.people)
         for name in m.get("speakers") or []:
             self.people.addWidget(avatar(name, m["avatars"].get(name)))
@@ -1297,36 +1427,44 @@ class MeetingPillWidget(QFrame):
     resume_clicked = Signal()
     decline_clicked = Signal()
     pinned_changed = Signal(bool)
+    buffer_record_clicked = Signal()
 
     def __init__(self, parent=None, pinned: bool = False):
         super().__init__(parent)
         self.pinned = pinned
+        self.buffering = False
         self.state = "capsule" if pinned else "island"
         self.paused = False
         self.dead = False
         self.them_label = "Them"
+        self.feed = LevelFeed()
+        self._cw, self._vw = 180.0, 0.0   # width and panel height spring (ui.motion constants, like the dictation island)
+        self._cp, self._vp = 0.0, 0.0
+        self._tw, self._tp = 180.0, 0.0
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 6, 8, 6)
+        root.setContentsMargins(14, 6, 10, 6)
         root.setSpacing(8)
 
         top = QHBoxLayout()
-        top.setSpacing(8)
+        top.setSpacing(10)
         self.dot = QLabel()
         self.dot.setObjectName("RecDot")
-        self.dot.setFixedSize(10, 10)
+        self.dot.setFixedSize(8, 8)
         self.dot.setToolTip("Recording")
+        self._dot_fx = QGraphicsOpacityEffect(self.dot)  # the REC dot breathes 1.6 s, like the dictation island
+        self.dot.setGraphicsEffect(self._dot_fx)
         top.addWidget(self.dot)
+        self.island_bars = LiveMeter(self.feed)
+        self.island_bars.setToolTip("Live level: cyan is you, white is the call")
+        top.addWidget(self.island_bars)
         self.lbl_time = _label("0:00", "PillTime", "Recorded so far")
         top.addWidget(self.lbl_time)
-        self.island_bars = QWidget()
-        ib = QHBoxLayout(self.island_bars)
-        ib.setContentsMargins(0, 0, 0, 0)
-        ib.setSpacing(6)
-        self.bars = {k: [LevelBars(6), LevelBars(10), LevelBars(14)] for k in ("me", "them")}
-        ib.addWidget(self.bars["me"][0])
-        ib.addWidget(self.bars["them"][0])
-        self.island_bars.setToolTip("Your mic level and the call level")
-        top.addWidget(self.island_bars)
+        self.people_stack = QWidget()  # who is in this meeting: the thing a dictation pill never shows
+        self._stack = QHBoxLayout(self.people_stack)
+        self._stack.setContentsMargins(0, 0, 0, 0)
+        self._stack.setSpacing(-5)
+        top.addWidget(self.people_stack)
+        self._meeting_key = None
         self.capsule_meters = self._meters(1)
         top.addWidget(self.capsule_meters)
         self.lbl_dead = _label("", "Body")
@@ -1345,7 +1483,11 @@ class MeetingPillWidget(QFrame):
         self.btn_decline.clicked.connect(self.decline_clicked.emit)
         self.btn_arrow = icon_button("chevron_right", "", "Pin open as a capsule", "PillBtn")
         self.btn_arrow.clicked.connect(self._toggle_pin)
-        for b in (self.btn_pause, self.btn_stop, self.btn_missed_inline, self.btn_resume, self.btn_decline, self.btn_arrow):
+        self.btn_buf_record = button("Record this call", "AccentBtn", "mic",
+                                    "Keep the buffered minutes and keep recording from here")
+        self.btn_buf_record.clicked.connect(self.buffer_record_clicked.emit)
+        for b in (self.btn_pause, self.btn_stop, self.btn_missed_inline, self.btn_resume, self.btn_decline,
+                  self.btn_buf_record, self.btn_arrow):
             top.addWidget(b)
         root.addLayout(top)
 
@@ -1353,6 +1495,12 @@ class MeetingPillWidget(QFrame):
         pv = QVBoxLayout(self.panel)
         pv.setContentsMargins(0, 0, 4, 4)
         pv.setSpacing(8)
+        self.lbl_title = ClampLabel("", 1, "Body")
+        pv.addWidget(self.lbl_title)
+        self.lbl_place = _label("", "Meta")
+        pv.addWidget(self.lbl_place)
+        self.lbl_people = _label("", "Meta", wrap=True)
+        pv.addWidget(self.lbl_people)
         pv.addWidget(self._meters(2))
         self.btn_missed = button("What did I miss?", "AccentBtn", "undo", "Recap the last 5 minutes (free OpenRouter model)")
         self.btn_missed.clicked.connect(self.missed_clicked.emit)
@@ -1372,23 +1520,31 @@ class MeetingPillWidget(QFrame):
         self.lbl_next = _label("Waiting for the first chunk", "Meta", "Transcript arrives in finished chunks")
         pv.addWidget(self.lbl_next)
         root.addWidget(self.panel)
+        self._ribbons = [r for w in self._meter_widgets for r in w.findChildren(LiveRibbon)]
+        self._timer = QTimer(self)  # one 60 fps timer, runs only while the pill is on screen
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._frame)
         self._apply()
 
     def _meters(self, idx: int) -> QWidget:
+        """Two lanes, you and the call. idx 1 is the pinned capsule (side by side), 2 the hover panel (stacked)."""
         w = QWidget()
-        h = QHBoxLayout(w)
+        h = QHBoxLayout(w) if idx == 1 else QVBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
-        for key, glyph in (("me", "mic"), ("them", "volume")):
+        for key, glyph, token in (("me", "mic", "cyan"), ("them", "volume", "ink")):
+            lane = QHBoxLayout() if idx != 1 else h
+            lane.setSpacing(6)
             ic = QLabel()
             ic.setPixmap(glyph_icon(glyph, 12, T["ink_dim"]).pixmap(12, 12))
-            h.addWidget(ic)
+            lane.addWidget(ic)
             lbl = _label("You" if key == "me" else self.them_label, "Meta")
+            lbl.setMinimumWidth(44)
             setattr(w, f"lbl_{key}", lbl)
-            h.addWidget(lbl)
-            h.addWidget(self.bars[key][idx])
-            h.addSpacing(6)
-        h.addStretch(1)
+            lane.addWidget(lbl)
+            lane.addWidget(LiveRibbon(self.feed, key, token), 1)
+            if idx != 1:
+                h.addLayout(lane)
         w.setToolTip("Live levels: your mic and the call")
         self._meter_widgets = getattr(self, "_meter_widgets", []) + [w]
         return w
@@ -1407,38 +1563,145 @@ class MeetingPillWidget(QFrame):
         self.setObjectName({"island": "PillIsland", "capsule": "PillCapsule"}.get(s, "PillPanel"))
         self.style().unpolish(self)
         self.style().polish(self)
-        self.island_bars.setVisible(s == "island" and not dead)
-        self.capsule_meters.setVisible(s == "capsule" and not dead)
+        buf = self.buffering and not dead  # a buffer shows only its clock and, on hover, Record this call
+        live = not buf and not dead
+        self.island_bars.setVisible(s != "capsule" and live)
+        self.capsule_meters.setVisible(s == "capsule" and live)
+        self.people_stack.setVisible(live and self._stack.count() > 0 and s != "panel")
         self.lbl_dead.setVisible(dead)
         for b in (self.btn_pause, self.btn_stop):
-            b.setVisible(s != "island" and not dead)
-        self.btn_missed_inline.setVisible(s == "capsule" and not dead)
+            b.setVisible(s != "island" and live)
+        self.btn_missed_inline.setVisible(s == "capsule" and live)
         self.btn_resume.setVisible(dead)
         self.btn_decline.setVisible(dead)
-        self.btn_arrow.setVisible(not dead)
-        self.panel.setVisible(s == "panel" and not dead)
+        self.btn_buf_record.setVisible(buf and s != "island")
+        self.btn_arrow.setVisible(s != "island" and live)  # the island is just dot, bars, time
         self.btn_arrow.setIcon(glyph_icon("chevron_left" if self.pinned else "chevron_right", 14, T["ink_muted"]))
         self.btn_arrow.setToolTip("Collapse to the island" if self.pinned else "Pin open as a capsule")
+        self._retarget()
+        if not self._timer.isActive():  # off screen (or a test): no animation to wait for
+            self._cw, self._cp, self._vw, self._vp = self._tw, self._tp, 0.0, 0.0
+            self._layout_now()
+
+    def _retarget(self):
+        """Where the spring is heading: island hugs its content, capsule and panel have fixed widths."""
+        s, dead = self.state, self.dead
+        if dead:
+            self._tw = 520.0
+        elif s == "island" or self.buffering:
+            self.layout().invalidate()  # the cached size ignores a longer clock text
+            self._tw = float(self.layout().sizeHint().width() + 4)  # + the QSS border (1 px a side), which the layout does not count
+        else:
+            self._tw = float({"capsule": 620}.get(s, 400))
+        self._tp = float(self.panel.layout().sizeHint().height()) if s == "panel" and not dead and not self.buffering else 0.0
+
+    def _layout_now(self):
+        """Apply the sprung width and panel height; the host keeps its centre x so growth is symmetric."""
         win = self.window()
-        # the host is centred once on show; keep that centre x so hover growth is symmetric
         cx = win.x() + win.width() // 2 if win is not self and win.isVisible() else None
-        self.setFixedWidth(520 if dead else {"island": 180, "capsule": 620}.get(s, 400))
+        self.panel.setVisible(self._cp > 1.0)
+        self.panel.setMaximumHeight(max(0, int(round(self._cp))))
+        self.setFixedWidth(int(round(self._cw)))
         self.adjustSize()
         if win is not self:
             win.adjustSize()
             if cx is not None:
                 win.move(cx - win.width() // 2, win.y())
 
+    def _spring(self):
+        if not motion.enabled():
+            self._cw, self._cp, self._vw, self._vp = self._tw, self._tp, 0.0, 0.0
+            return
+        k, d = motion.SPRING_K, motion.SPRING_D
+        self._vw = (self._vw + k * (self._tw - self._cw)) * d
+        self._vp = (self._vp + k * (self._tp - self._cp)) * d
+        self._cw += self._vw
+        self._cp = max(0.0, self._cp + self._vp)
+        if abs(self._tw - self._cw) < 0.3 and abs(self._vw) < 0.05:
+            self._cw, self._vw = self._tw, 0.0
+        if abs(self._tp - self._cp) < 0.3 and abs(self._vp) < 0.05:
+            self._cp, self._vp = self._tp, 0.0
+
+    def _frame(self):
+        silent = self.paused or self.dead or self.buffering
+        self.feed.step(silent)
+        tick = self.feed.tick
+        settling = self._cw != self._tw or self._cp != self._tp
+        if settling or tick % 20 == 0:  # was every frame: a layout invalidate 60 times a second burned CPU beside dictation
+            self._retarget()  # the island hugs its clock text, the panel follows its chunks and answer
+        if settling:
+            before = (round(self._cw), round(self._cp))
+            self._spring()
+            if (round(self._cw), round(self._cp)) != before:
+                self._layout_now()
+        if tick % 3 == 0:  # the dot breathes at 20 fps: each opacity change re-renders it
+            breathe = 1.0 if (silent or not motion.enabled()) else 0.675 + 0.325 * math.cos(tick * 0.016 * 2 * math.pi / 1.6)
+            self._dot_fx.setOpacity(breathe)
+        if max(self.feed.wave_mix) < 0.004 and self.feed.me < 0.004 and self.feed.them < 0.004:
+            return  # flat for the whole wave window: nothing on screen is moving, so nothing to repaint
+        self.island_bars.update()
+        if self.state != "island":
+            for r in self._ribbons:
+                r.update()
+
+    def showEvent(self, e):
+        self._timer.start()
+        super().showEvent(e)
+
+    def hideEvent(self, e):
+        self._timer.stop()
+        self.feed.attach(None)  # release the levels.bin mapping: a mapped file blocks moving the folder on Windows
+        super().hideEvent(e)
+
+    def set_meeting(self, title: str, place: str, people: list):
+        """Identity of the recording: title and place in the hover panel, up to three avatars (+N) on the island.
+        Only rebuilds when something changed; called from the 2 s status poll."""
+        key = (title, place, tuple(people))
+        if key == self._meeting_key:
+            return
+        self._meeting_key = key
+        self.lbl_title.set_full(title or "Meeting")
+        self.lbl_place.setText(place)
+        self.lbl_place.setVisible(bool(place))
+        self.lbl_people.setText("  ·  ".join(people))
+        self.lbl_people.setVisible(bool(people))
+        _clear(self._stack)
+        for name in people[:3]:
+            av = avatar(name, None, 22)
+            av.setText(name[:2])  # two letters so two people sharing an initial stay distinct
+            self._stack.addWidget(av)
+        if len(people) > 3:
+            more = _label(f"+{len(people) - 3}", "Meta")
+            more.setContentsMargins(8, 0, 0, 0)
+            self._stack.addWidget(more)
+        self.island_bars.setToolTip(f"{title or 'Meeting'}\n" + ", ".join(people))
+        self.people_stack.setToolTip(", ".join(people))
+        self._apply()
+
+    def set_buffering(self, seconds, channel: str = ""):
+        """The retroactive buffer's indicator (None turns it off): a dim dot and 'buffer 12:03'. Nothing is saved
+        or transcribed until Record; it is deleted when you leave the voice channel."""
+        on = seconds is not None
+        if on:
+            m, s = divmod(int(seconds), 60)
+            h, m = divmod(m, 60)
+            self.lbl_time.setText(f"buffer {h}:{m:02d}:{s:02d}" if h else f"buffer {m}:{s:02d}")
+            self.dot.setToolTip("Buffering the call")
+            self.lbl_time.setToolTip(f"Scribe is holding the last minutes of {channel or 'this call'} in a rolling buffer. "
+                                     "Nothing is saved or transcribed unless you press Record. Leaving the channel deletes it.")
+        if on != self.buffering:
+            self.buffering, self.paused, self.dead = on, False, False
+            _repolish(self.dot, state="buffer" if on else "rec")
+            self._apply()
+
     def set_status(self, elapsed_s: float, levels: dict, paused: bool, them_label: str = "Them"):
+        if self.buffering:
+            self.set_buffering(None)
         self.dead = False
         self.paused = paused
         m, s = divmod(int(elapsed_s), 60)
         h, m = divmod(m, 60)
-        self.lbl_time.setText(f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}")
-        for key in ("me", "them"):
-            lv = 0.0 if paused else _level((levels or {}).get(key))
-            for b in self.bars[key]:
-                b.push(lv)
+        self.lbl_time.setText(f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}")  # levels now arrive via self.feed, not here
         if them_label != self.them_label:
             self.them_label = them_label
             for w in self._meter_widgets:
@@ -1730,6 +1993,10 @@ class MeetingsView(QWidget):
         self._poll = QTimer(self)
         self._poll.setInterval(2000)
         self._poll.timeout.connect(self._poll_status)
+        self._buffer_poll = QTimer(self)
+        self._buffer_poll.setInterval(2000)
+        self._buffer_poll.timeout.connect(self._poll_buffer)
+        self._buffer_poll.start()
         self._recovery = QTimer(self)
         self._recovery.setInterval(10000)
         self._recovery.timeout.connect(self.refresh)
@@ -1867,6 +2134,7 @@ class MeetingsView(QWidget):
         for i, m in enumerate(items):
             card = MeetingCard(m, dest_names)
             card.clicked.connect(self.open_sheet)
+            card.share_requested.connect(lambda mdir, pos: self.share_menu(self._find(mdir), pos))
             card.set_selected(m["dir"] == self.selected)
             self.grid.addWidget(card, i // cols, i % cols)
             self._cards.append(card)
@@ -2153,6 +2421,43 @@ class MeetingsView(QWidget):
         cb.setCurrentIndex(max(0, i))
         cb.blockSignals(False)
 
+    def share_menu(self, m: dict, pos):
+        """One menu for sharing a meeting, from the card (right-click) and from the sheet."""
+        if m:
+            self.build_share_menu(m).exec(pos)
+
+    def build_share_menu(self, m: dict) -> QMenu:
+        """Copies go to the clipboard and say so; the page is one self-contained HTML file for people not in Scribe."""
+        menu = QMenu(self)
+        title = m.get("title") or "this meeting"
+
+        def copy(text: str, what: str):
+            QApplication.clipboard().setText(text)
+            self.host.toast(f"Copied {what}", "success")
+
+        menu.addAction("Copy for an agent (names the files to read)", lambda: copy(shr.agent_mention(m), "the agent line"))
+        menu.addAction("Copy note and transcript (Markdown)", lambda: self._share_async(
+            lambda: shr.as_markdown(m), lambda txt: copy(txt, "the note and transcript")))
+        menu.addAction("Copy folder path", lambda: copy(m["dir"], "the folder path"))
+        menu.addSeparator()
+        menu.addAction("Save as a shareable page (HTML)...", lambda: self._save_page(m))
+        menu.addAction("Show in folder", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(m["dir"])))
+        menu.setToolTip(f"Share {title}")
+        return menu
+
+    def _share_async(self, fn, done):
+        self._async(fn, done, "Could not build the share text")
+
+    def _save_page(self, m: dict):
+        start = os.path.join(os.path.expanduser("~"), "Desktop")
+        folder = QFileDialog.getExistingDirectory(self, "Save the page in", start if os.path.isdir(start) else os.path.expanduser("~"))
+        if not folder:
+            return
+        self._async(lambda: shr.save_page(m, folder), lambda path: (
+            QApplication.clipboard().setText(path),
+            self.host.toast("Saved the page. Its path is copied: attach that file anywhere.", "success"),
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))), "Could not save the page")
+
     def toggle_pin(self, m: dict):
         if not m:
             return
@@ -2372,9 +2677,29 @@ class MeetingsView(QWidget):
         box.exec()
         if box.clickedButton() is not ok:
             return
+        self._record_now()
+
+    def _record_now(self):
         audio = (getattr(self.host, "config", None) or {}).get("audio") or {}
         self.start_recording({"kind": "device", "app": None, "pid": None, "device": "default",
                               "mic_device": audio.get("device_index")})
+
+    # ----- retroactive buffer indicator --------------------------------------
+    def _poll_buffer(self):
+        """The pill shows 'buffer 12:03' while Scribe holds the last minutes of a Discord call you are in. Not
+        recording and no end card: that is the only time it is on screen for a buffer."""
+        import meeting_service as msvc
+        svc = getattr(msvc.MeetingService, "current", None)
+        st = None if (self.rec_dir or (self._end_host is not None and self._end_host.isVisible())) else \
+            (svc.preroll_status() if svc else None)
+        if st:
+            pill = self.pill()
+            pill.set_buffering(st["seconds"], st.get("channel") or "")
+            if not self._pill_host.isVisible():
+                self._show_pill()
+        elif self._pill_host is not None and self._pill_host.child.buffering:
+            self._pill_host.child.set_buffering(None)
+            self._pill_host.hide()
 
     def start_recording(self, source: dict):
         """Public API for the app shell. source: manifest source {kind, app, pid, device, mic} plus optional
@@ -2409,6 +2734,8 @@ class MeetingsView(QWidget):
                                                          "discord_id": p.get("discord_id"), "avatar_path": None}
                                                         for p in (ch or {}).get("participants") or []] or None,
                                 destination_id=dest, template_id=tmpl)
+            if svc:
+                svc.promote_preroll(mdir)  # the buffered minutes of this call become the start of the meeting
             _starting(mdir)  # a fresh heartbeat, so the recovery scan never flags a worker still booting
             pid = mr.start_worker(mdir)
             if svc:
@@ -2431,6 +2758,8 @@ class MeetingsView(QWidget):
 
     def _adopt(self, mdir: str, title: str):
         self.rec_dir, self._rec_title = mdir, title
+        if self._pill_host is not None:
+            self._pill_host.child.set_buffering(None)
         self.btn_record.setText("  Stop")
         self.btn_record.setIcon(glyph_icon("stop", 14, T["crimson_text"]))
         self.btn_record.setToolTip("Stop recording and save the meeting")
@@ -2532,6 +2861,45 @@ class MeetingsView(QWidget):
             return pid
         self._async(job, started, "Could not resume")
 
+    def continue_meeting(self, m: dict):
+        """Keep recording into any past meeting, however old: its audio is rebuilt from Opus, new audio is appended
+        to the same timeline, and Stop rebuilds the transcript and note over the whole call."""
+        if not m:
+            return
+        if self.rec_dir:
+            self.host.toast("Already recording. Stop the current meeting first.", "warn")
+            return
+        mdir, title = m["dir"], m.get("title") or "this meeting"
+        box = QMessageBox(QMessageBox.Icon.Question, "Continue meeting",
+                          f"Keep recording into “{title}”?\n\nNew audio is added to the end. When you stop, the transcript "
+                          f"and note are rebuilt over the whole call (the old note is kept next to it as note.json.prev).",
+                          QMessageBox.StandardButton.Cancel, self)
+        go = box.addButton("Continue recording", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(go)
+        box.exec()
+        if box.clickedButton() is not go:
+            return
+        self.close_all()
+
+        def job():
+            import meeting_service as msvc  # lazy: it lists audio sessions through ScribeCapture
+            source = msvc.prefer_call_audio({"kind": "device", "app": None, "pid": None, "device": "default"})
+            pid = mr.resume_meeting(mdir, reason="user_resume", source=source)
+            _starting(mdir)
+            svc = getattr(msvc.MeetingService, "current", None)
+            if svc:
+                svc.attach(mdir)  # speaking events and channel switches land in this meeting again
+            return pid
+
+        def started(res):
+            if isinstance(res, Exception):
+                self.host.toast(f"Could not continue: {str(res)[:160]}", "error")
+                return
+            self._adopt(mdir, title)
+            self.host.toast(f"Continuing: {title}", "success")
+            self.refresh()
+        run_async(job, lambda r: self._safe(started, r))
+
     def decline(self, mdir: str):
         me, title = self._user_name(), self._rec_title or "The recording"
         self._release()
@@ -2547,6 +2915,7 @@ class MeetingsView(QWidget):
             p.missed_clicked.connect(self._pill_missed)
             p.resume_clicked.connect(lambda: self.rec_dir and self.resume(self.rec_dir))
             p.decline_clicked.connect(lambda: self.rec_dir and self.decline(self.rec_dir))
+            p.buffer_record_clicked.connect(self._record_now)  # an explicit click on the pill: no confirm dialog
             p.pinned_changed.connect(self._remember_pin)
             self._pill_host = _FloatingHost(p)
         return self._pill_host.child
@@ -2606,6 +2975,15 @@ class MeetingsView(QWidget):
         if mdir != self.rec_dir:
             return
         pill = self.pill()
+        pill.feed.attach(mdir)
+        names = [p.get("name") or p.get("key") for p in man.get("participants") or [] if p.get("name") or p.get("key")]
+        me = self._user_name()
+        if me and me not in names:
+            names.insert(0, me)  # you are always in your own meeting (the sheet once showed everyone but you)
+        pill.set_meeting(man.get("title") or self._rec_title or "Meeting",
+                         fmt_place({"discord": man.get("discord"), "discord_channels": man.get("discord_channels")}), names)
+        lv = st.get("levels") or {}
+        pill.feed.fallback = (float(lv.get("me") or 0.0), float(lv.get("them") or 0.0))
         age = time.time() - float(st.get("heartbeat_at", 0) or 0)
         if age > HEARTBEAT_DEAD_S and st.get("state") not in ("stopped",):
             pill.set_dead(float(st.get("me_seconds") or 0.0))

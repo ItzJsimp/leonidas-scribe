@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -137,7 +138,7 @@ class MeetingService:
                  worker_kwargs=None, poll_s=POLL_S, retry_s=30.0, now=time.monotonic):
         self._get_config = get_config
         self._save_config = save_config
-        self.store_root = store_root or os.path.join(HERE, "meetings")
+        self.store_root = store_root or mr.default_store_root()
         self.on_prompt, self.on_recovery, self.on_status, self.on_start = on_prompt, on_recovery, on_status, on_start
         self._rpc_factory = rpc_factory or _default_rpc_factory
         self._sessions = sessions_fn or list_audio_sessions
@@ -159,6 +160,80 @@ class MeetingService:
         self._last_recovery = self._last_sweep = 0.0
         self._t0_wall = time.time()
         self.running = False
+        self._pre: dict | None = None  # the running retroactive buffer {dir, pid, channel_id}
+        self._pre_lock = threading.Lock()
+        self._pre_hold_until = 0.0
+        self.preroll_dir = os.path.join(os.path.dirname(os.path.abspath(self.store_root)), "preroll")  # next to meetings/, so tests never touch the real one
+
+    # ------------------------------------------------------------ retroactive buffer (pre-roll)
+    def _preroll_minutes(self) -> float:
+        return float(self._m().get("preroll_minutes", 60) or 0)
+
+    def preroll_status(self) -> dict | None:
+        """{seconds} of audio buffered right now, or None when no buffer is running (the pill's indicator)."""
+        pre = self._pre
+        if not pre:
+            return None
+        st = mr.read_status(pre["dir"]) or {}
+        if st.get("state") != "buffering":
+            return None
+        pruned = float((mr.read_manifest(pre["dir"]) or {}).get("ring_pruned_s") or 0.0)
+        return {"seconds": max(0.0, float(st.get("me_seconds") or 0.0) - pruned), "channel": (self._channel or {}).get("channel")}
+
+    def _preroll_sync(self):
+        """Keep a rolling buffer of the call while you are in a Discord voice channel and not recording, so a
+        missed Record prompt (2026-10-10: a day-long call lost) costs nothing. It transcribes nothing, expires
+        after preroll_minutes, is deleted when you leave the channel, and Record promotes it into the meeting."""
+        if not self._pre_lock.acquire(blocking=False):
+            return
+        try:
+            want = (self._enabled() and self._preroll_minutes() > 0 and bool(self._channel) and not self._active
+                    and time.time() >= self._pre_hold_until and not self._stop.is_set())
+            pre = self._pre
+            if pre and self._rpc is None and pid_alive((mr.read_status(pre["dir"]) or {}).get("pid")):
+                return  # Discord RPC is down or still reconnecting after a restart: neither drop nor renew the lease
+            if pre and (not pid_alive((mr.read_status(pre["dir"]) or {}).get("pid"))
+                        or pre.get("channel_id") != (self._channel or {}).get("channel_id")):
+                self._preroll_drop_locked()  # dead worker, or you moved to another channel: that audio is not this call's
+                pre = None
+            if want and not pre:
+                self._preroll_start_locked()
+            elif pre and not want:
+                self._preroll_drop_locked()
+            elif pre:
+                mr.send_worker_command(pre["dir"], "lease")  # the worker stops itself if these stop (app died)
+        except Exception as e:
+            print(f"[MeetingService] preroll sync failed: {e}")
+        finally:
+            self._pre_lock.release()
+
+    def _preroll_start_locked(self):
+        src = discord_source(self._sessions() or []) or {"kind": "device", "app": None, "pid": None, "device": "default"}
+        shutil.rmtree(self.preroll_dir, ignore_errors=True)
+        mr.init_meeting_dir(self.preroll_dir, title="buffer", source=src, discord=discord_fields(self._channel))
+        pid = mr.start_worker(self.preroll_dir, preroll_s=self._preroll_minutes() * 60.0)
+        mr.send_worker_command(self.preroll_dir, "lease")
+        self._pre = {"dir": self.preroll_dir, "pid": pid, "channel_id": (self._channel or {}).get("channel_id")}
+        self._status("buffering", {"channel": (self._channel or {}).get("channel")})
+
+    def _preroll_drop_locked(self):
+        pre, self._pre = self._pre, None
+        if pre:
+            mr.stop_buffer(pre["dir"], timeout=4.0)
+            shutil.rmtree(pre["dir"], ignore_errors=True)  # leaving the channel deletes what was buffered
+            self._status("buffer_dropped", {})
+
+    def promote_preroll(self, mdir: str) -> float:
+        """Record pressed: move the buffer into meeting folder mdir (call before its worker starts). Seconds adopted."""
+        with self._pre_lock:
+            pre, self._pre = self._pre, None
+            self._pre_hold_until = time.time() + 20.0  # until the new worker is attached, do not restart a buffer
+        if not pre:
+            return 0.0
+        try:
+            return mr.promote_preroll(pre["dir"], mdir)
+        finally:
+            shutil.rmtree(pre["dir"], ignore_errors=True)
 
     # ------------------------------------------------------------ config / helpers
     def _m(self) -> dict:
@@ -227,8 +302,28 @@ class MeetingService:
             t.join(1.0)
 
     # ------------------------------------------------------------ boot: recovery, finalize re-run, retention
+    def _adopt_running_worker(self):
+        """A worker outlives a Scribe restart (source-watch self-restart, crash). Re-attach to it, or its Discord
+        speaking events stop being logged (2026-10-10: speakers lost after minute 16 of a 41 minute call) and the
+        call prompt offers to record the same call a second time."""
+        pre_st = mr.read_status(self.preroll_dir) or {}
+        if not self._pre and pre_st.get("state") == "buffering" and pid_alive(pre_st.get("pid")):
+            man = mr.read_manifest(self.preroll_dir) or {}  # the buffer survives a restart too: keep its hour
+            self._pre = {"dir": self.preroll_dir, "pid": pre_st["pid"], "channel_id": (man.get("discord") or {}).get("channel_id")}
+        if self._active:
+            return
+        for mdir, m in list(self._iter_meetings()):
+            if m.get("state") not in ("recording", "paused"):
+                continue
+            st = mr.read_status(mdir) or {}
+            if pid_alive(st.get("pid")) and time.time() - float(st.get("heartbeat_at") or 0) < 15:
+                if self.attach(mdir):
+                    self._status("adopted", {"meeting_dir": mdir})
+                return
+
     def _boot(self):
         try:
+            self._adopt_running_worker()
             self._recovery_scan(first=True)
             self._rerun_pending()
             self._sweep()
@@ -310,6 +405,8 @@ class MeetingService:
                 mdir = f"{base}-{n}"
             manifest = mr.init_meeting_dir(mdir, title=title, source=source, discord=discord,
                                            participants=participants, destination_id=destination_id, template_id=template_id)
+            if self.promote_preroll(mdir):
+                manifest = mr.read_manifest(mdir) or manifest  # the call started where the buffered audio starts
             self._begin(mdir, manifest, kind=kind, key=key, spawn=True)
             return mdir
 
@@ -357,7 +454,7 @@ class MeetingService:
 
     def _note(self, mdir, ev):
         try:
-            note_channel(mdir, ev, time.time() - self._t0_wall)
+            note_channel(mdir, ev, mr.wall_to_audio(mr.read_manifest(mdir) or {}, time.time()))
         except Exception as e:
             print(f"[MeetingService] channel note failed: {e}")
 
@@ -386,6 +483,14 @@ class MeetingService:
                 wall = time.time()
                 self._log_f.write(json.dumps(dict(ev, wall=wall, t=round(wall - self._t0_wall, 3)), ensure_ascii=False) + "\n")
                 self._log_f.flush()  # ponytail: no fsync per event; a power cut loses the last few speaking events only
+            elif self._pre:
+                # the retroactive buffer needs speakers too, or its minutes come out as "Them" (2026-10-10: the first
+                # 8.5 minutes of a call). promote_preroll carries this file into the meeting.
+                try:
+                    with open(os.path.join(self._pre["dir"], "speaking.jsonl"), "a", encoding="utf-8") as f:
+                        f.write(json.dumps(dict(ev, wall=time.time()), ensure_ascii=False) + "\n")
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------ prompts
     def _destination_name(self, dest_id):
@@ -464,6 +569,7 @@ class MeetingService:
             return
         if e == "channel":
             self._on_channel(ev)
+            self._spawn(self._preroll_sync, name="meeting-preroll")
         if e in ("channel", "start", "stop", "join", "leave"):
             self._log_event(ev)
 
@@ -530,7 +636,9 @@ class MeetingService:
             self.stop_recording(auto=True)
         self._watch_finalizing()
         now = self._now()
+        self._preroll_sync()
         if now - self._last_recovery >= RECOVERY_EVERY_S:
+            self._adopt_running_worker()
             self._recovery_scan()
         if now - self._last_sweep >= SWEEP_EVERY_S:
             self._sweep()

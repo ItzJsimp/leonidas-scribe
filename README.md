@@ -75,3 +75,12 @@ Leonidas Scribe includes a background Git auto-updater:
 - **Calm Mode:** If you prefer reduced motion, toggle Calm mode under **Settings > Motion & Sound**.
 - **Game Mode:** Scribe automatically detects fullscreen games and suspends hotkeys so you never accidentally trigger dictation mid-game.
 - **Hotkeys:** You can rebind any shortcut to your liking in **Settings > Hotkeys**.
+
+
+### Updates and notifications
+
+Git-clone installations check their release channel every 15 seconds and apply updates when dictation, transforms and meetings are idle. Forks follow their configured origin; ZIP copies have no Git update channel. The **Notifications** button and tray menu show unread alerts, release history, mute controls and a manual update check. Windows may suppress desktop banners through Do Not Disturb; alerts remain in the inbox.
+
+On first launch, Scribe adds Claude completion and approval hooks to the current user's settings, preserving existing hooks and permissions with a backup. Existing Claude sessions may need reopening. Set `notifications.auto_setup` to `false` to opt out of automatic hook setup. These hooks report a finished response or a pending approval, not inferred progress or the result of every tool call.
+
+AIOS checkouts automatically read their local notification stream. Standalone installs can set `notifications.streams` to local JSONL streams. Other tools can send an alert through [`notification_cli.py`](./notification_cli.py) with `python notification_cli.py --title "Build failed" --text "Check the build log" --level warn`. All notification state stays on the user's machine.

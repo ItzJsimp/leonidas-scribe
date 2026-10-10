@@ -33,6 +33,7 @@ from ui.views.voice import VoiceView
 from ui.views.meetings import MeetingsView
 from ui.views.home import HomeView
 from ui.views.goals import GoalsView
+from ui.views.copy import CopyView, previous_app_hwnd
 from ui.celebrate import Celebrator
 import goals as goals_engine
 from ui.views.settings import SECTIONS, SettingsView
@@ -55,6 +56,7 @@ class DashboardWindow(QMainWindow):
         ("library", "Dictionary"),
         ("volume", "Voice"),
         ("mic", "Meetings"),
+        ("copy", "Copy"),
         ("settings", "Settings"),
     ]
 
@@ -75,6 +77,10 @@ class DashboardWindow(QMainWindow):
         self.on_settings_saved = on_settings_saved_cb
         self.is_really_quitting = False
         self._toast = None
+        from notifications import NotificationStore
+        from pathlib import Path
+        self.notification_store = NotificationStore(Path(self.config_path).parent / 'notifications.db')
+        self._notification_inbox = None
 
         load_brand_fonts()
         self.load_data()
@@ -89,12 +95,15 @@ class DashboardWindow(QMainWindow):
         apply_native_window_chrome(self)
 
         app = QApplication.instance()
-        self._focus_glow = motion.FocusGlow(app)
         self._hover = motion.Hover(self)
         app.installEventFilter(self._hover)
 
         self._init_ui()
         self._init_tray()
+        self._notification_timer = QTimer(self)
+        self._notification_timer.timeout.connect(self._poll_notifications)
+        self._notification_timer.start(1000)
+        threading.Thread(target=self._notification_setup, daemon=True).start()
         self.palette = CommandPalette(self, self._commands)
         QShortcut(QKeySequence("Ctrl+K"), self, activated=self.open_palette)
         for i in range(len(self.NAV)):
@@ -139,6 +148,27 @@ class DashboardWindow(QMainWindow):
             self.on_toggle_dictation()
         else:
             self.toast("Dictation is only available while Scribe's engine is running.", "warn")
+
+    # ---- Copy page: LeonidasScribe.py hands over the history store and a paste function
+    def attach_clips(self, store, watcher, paste_fn):
+        self.clip_store, self._clip_paste = store, paste_fn
+        self.copy_view.bind(store, watcher)
+
+    def paste_clip(self, text):
+        """Paste into the app that was in front before this window (z-order, not focus)."""
+        fn = getattr(self, "_clip_paste", None)
+        if fn is None:
+            self.toast("Copy history is not running.", "warn")
+            return
+        fn(text, previous_app_hwnd(int(self.winId())))
+
+    def save_clipboard_enabled(self, enabled):
+        def job():
+            fresh = self.controller.load_config()
+            fresh.setdefault("clipboard_history", {})["enabled"] = bool(enabled)
+            return self.controller.save_config(fresh)
+        self.config.setdefault("clipboard_history", {})["enabled"] = bool(enabled)
+        run_async(job, lambda _r: None)
 
     def learn_correction(self, wrong, correct):
         ok, msg = self.controller.add_replacement(wrong, correct)
@@ -193,10 +223,11 @@ class DashboardWindow(QMainWindow):
         self.dictionary_view = DictionaryView(self)
         self.voice_view = VoiceView(self)
         self.meetings_view = MeetingsView(self)
+        self.copy_view = CopyView(self)
         self.settings_view = SettingsView(self)
         self.settings_view.dirty_changed.connect(self._on_settings_dirty)
         for view in (self.home_view, self.goals_view, self.history_view, self.transforms_view, self.insights_view,
-                     self.dictionary_view, self.voice_view, self.meetings_view, self.settings_view):
+                     self.dictionary_view, self.voice_view, self.meetings_view, self.copy_view, self.settings_view):
             self.tabs.addWidget(view)
 
         # Expose sub-view controls on DashboardWindow for test contracts and callers
@@ -290,7 +321,72 @@ class DashboardWindow(QMainWindow):
 
     def notify(self, title: str, message: str):
         """Native Windows notification from the tray icon (alerts, reports)."""
-        self.tray_icon.showMessage(title, message, get_app_icon(), 10000)
+        self.notification_store.add({'title': title, 'text': message, 'kind': 'app'})
+
+    def on_update_status(self, kind, message):
+        # Called by the updater thread: SQLite only, never Qt widgets.
+        if kind in ('available', 'waiting', 'applied', 'error'):
+            self.notification_store.add({'id': 'update:' + message, 'at': message,
+                                         'title': 'Scribe update', 'text': message,
+                                         'kind': 'update', 'level': 'warn' if kind == 'error' else 'info'})
+
+    def _notification_setup(self):
+        from pathlib import Path
+        import json
+        from notifications import install_claude_hooks, discover_streams, StreamReader
+        base = Path(self.config_path).parent
+        if self.config.get('notifications', {}).get('auto_setup', True):
+            try:
+                import os
+                settings = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'settings.json'
+                install_claude_hooks(settings, base)
+                self.notification_store.add({'id': 'setup:claude', 'at': 'setup-v1', 'title': 'Notifications ready',
+                    'text': 'Chat completion and approval alerts are connected. Existing Claude sessions may need reopening.', 'kind': 'setup'})
+            except Exception as exc:
+                self.notification_store.add({'id': 'setup:error', 'at': 'setup-v1', 'title': 'Notification setup needs help', 'text': str(exc), 'level': 'warn'})
+        try:
+            release = json.loads((base / 'release.json').read_text(encoding='utf-8-sig'))
+            self.notification_store.add({'id': 'release:' + release['version'], 'at': release['version'],
+                'title': 'Scribe v' + release['version'], 'text': release.get('notes', 'App updated'), 'kind': 'update'})
+        except (OSError, ValueError, KeyError):
+            pass
+        readers = [StreamReader(path, self.notification_store) for path in discover_streams(base, self.config)]
+        while not self.is_really_quitting:
+            for reader in readers:
+                try:
+                    reader.poll()
+                except Exception as exc:
+                    print('[Scribe Notifications] Stream unavailable:', exc)
+            time.sleep(1)
+
+    def _poll_notifications(self):
+        pending = self.notification_store.history(pending=True)
+        eligible = [e for e in pending if e.get('level') not in ('log', 'resolved') and
+                    not self.notification_store.preference('muted', False) and
+                    not (e.get('kind') == 'chat' and e.get('level') == 'info' and self.notification_store.preference('mute_chat', False))]
+        for event in pending:
+            if event not in eligible:
+                self.notification_store.delivered(event['key'])
+        if eligible:
+            priority = {'critical': 0, 'fail': 1, 'warn': 2, 'info': 3}
+            event = min(eligible, key=lambda e: priority.get(e.get('level'), 3))
+            self.notification_store.delivered(event['key'])
+            # Keep bursts in the inbox, but present only one desktop alert per poll.
+            self.tray_icon.showMessage(event['title'], event['text'], get_app_icon(), 10000)
+            if self.isVisible():
+                self.toast(event['title'] + ': ' + event['text'], 'warn' if event.get('level') in ('warn', 'critical', 'fail') else 'info', 'Open', self.open_notifications)
+        count = self.notification_store.unread_count()
+        self.btn_notifications.setText('Notifications' + (f' ({count})' if count else ''))
+
+    def open_notifications(self):
+        from ui.notification_inbox import NotificationInbox
+        if self._notification_inbox is None:
+            self._notification_inbox = NotificationInbox(self)
+        self.show_dashboard()
+        self._notification_inbox.refresh()
+        self._notification_inbox.show()
+        self._notification_inbox.raise_()
+        self._notification_inbox.activateWindow()
 
     def _poll_state(self):
         """The rail status block mirrors the engine, 4 times a second, only while visible."""
@@ -447,6 +543,9 @@ class DashboardWindow(QMainWindow):
         pal_row.addWidget(kbd("Ctrl K"))
         v.addSpacing(4)
         v.addLayout(pal_row)
+        self.btn_notifications = button('Notifications', 'GhostBtn', 'history', 'Read app updates, AIOS alerts and chat status. No AI calls.')
+        self.btn_notifications.clicked.connect(self.open_notifications)
+        v.addWidget(self.btn_notifications)
         v.addSpacing(10)
 
         status = QFrame()
@@ -576,6 +675,8 @@ class DashboardWindow(QMainWindow):
         tray_menu.addSeparator()
         tray_menu.addAction(glyph_icon("close", 14), "Quit Leonidas Scribe").triggered.connect(self._quit_application)
         self.tray_icon.setContextMenu(tray_menu)
+        tray_menu.addAction('Notifications').triggered.connect(self.open_notifications)
+        self.tray_icon.messageClicked.connect(self.open_notifications)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
 

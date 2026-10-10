@@ -378,6 +378,21 @@ class AudioRecorder:
         return self._wav_from_array(compact)
 
 
+def goal_prompt_problems(text: str) -> list:
+    """Contract for the Goal Prompt preset: one /goal line, under 1000 chars, no em dash."""
+    t = (text or "").strip()
+    problems = []
+    if not t.startswith("/goal "):
+        problems.append("missing /goal prefix")
+    if "\n" in t:
+        problems.append("more than one line")
+    if len(t) >= 1000:
+        problems.append("1000 characters or more")
+    if chr(0x2014) in t:
+        problems.append("em dash")
+    return problems
+
+
 class DictationEngine:
     def __init__(self, config_path=None, dictionary_path=None):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1290,8 +1305,16 @@ class DictationEngine:
             try:
                 result = self._call_polish_api(url, key, model, user_content, dynamic_max_tokens, system_prompt=system_prompt,
                                                  timeout=self.config.get("api", {}).get("transform_timeout", 20))  # rewrites are long outputs, not dictation-latency calls
+                cleaned = self._tidy_rewrite(result)
+                # Rejected output falls through to the next tier, like a provider error does.
+                if matched and matched.get("output_check") == "goal_prompt":
+                    # Models drift to "Check: <fill in>"; the placeholder must be exact so it is easy to find.
+                    cleaned = re.sub(r"(?i)\bcheck:\s*<fill in>", "CHECK: <fill in>", cleaned)
+                    problems = goal_prompt_problems(cleaned)
+                    if problems:
+                        raise ValueError(f"Goal Prompt output rejected: {', '.join(problems)}")
                 self.last_transform_model = f"{provider}/{model}"
-                return self._tidy_rewrite(result)
+                return cleaned
             except Exception as exc:
                 last_error = exc
                 print(f"[LeonidasScribe Engine] Refactor {tier_name} failed ({provider}/{model}): {exc}")

@@ -64,27 +64,6 @@ def clear_glow(widget: QWidget) -> None:
         widget.setGraphicsEffect(None)
 
 
-_GLOWABLE = (QAbstractButton, QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QAbstractSpinBox, QFrame)
-
-
-class FocusGlow(QObject):
-    """Cyan glow follows keyboard focus. Buttons take focus from Tab only (see
-    ui.widgets.tab_focus_only), so a mouse click never leaves a ring behind."""
-
-    def __init__(self, app: QApplication):
-        super().__init__(app)
-        app.focusChanged.connect(self._moved)
-
-    @staticmethod
-    def _moved(old, new):
-        if old is not None and isinstance(old, _GLOWABLE):
-            clear_glow(old)
-        if new is not None and isinstance(new, _GLOWABLE) and new.graphicsEffect() is None:
-            if isinstance(new, QFrame) and new.objectName() != "Card":
-                return
-            glow(new, "cyan", 20, 90)
-
-
 def _rgba(token: str, alpha: float) -> QColor:
     col = QColor(T[token])
     col.setAlphaF(max(0.0, min(1.0, alpha)))

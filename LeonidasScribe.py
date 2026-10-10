@@ -158,6 +158,7 @@ class ScribeBridge(QObject):
     sig_history_updated = Signal()
     sig_show_dashboard = Signal()
     sig_show_preset_picker = Signal()
+    sig_show_quickpick = Signal(object)  # (target hwnd, perf_counter at the hotkey press)
     sig_alert = Signal(str, str)  # title, message: shown as a Windows notification
     sig_voice_reply_received = Signal(str)
     # HUD state mutates self.particles and calls show()/update(), which are GUI-thread-only
@@ -278,6 +279,15 @@ class LeonidasScribeApp:
             state_provider=self._engine_state,
         )
         self.bridge.sig_history_updated.connect(self.dashboard.refresh_history)
+        self.quickpick = None
+        if getattr(self, "clip_store", None):
+            self.dashboard.attach_clips(self.clip_store, self.clip_watcher, self._paste_clip)
+            try:
+                from ui.quickpick import QuickPick
+                self.quickpick = QuickPick(self.clip_store, self._paste_clip)
+                self.bridge.sig_show_quickpick.connect(lambda a: self.quickpick.open_near_cursor(*a))
+            except Exception as e:
+                print(f"[LeonidasScribe] Quick-pick init warning: {e}")
         # +XP rises out of the Island pill instead of a separate floater (picked 2026-10-09)
         self.dashboard.celebrator.xp_sink = lambda ev: self.hud.show_xp(ev.get("title", ""), xp_tier(ev))
         self.bridge.sig_alert.connect(self.dashboard.notify)
@@ -313,6 +323,8 @@ class LeonidasScribeApp:
             on_cancel=lambda: self.bridge.sig_cancel_recording.emit(),
             on_transform_trigger=lambda: self.bridge.sig_show_preset_picker.emit(),
             on_quiet_toggle_trigger=self._toggle_voice_quiet,
+            on_copy_quickpick=self._request_quickpick,
+            copy_quickpick_button=hk_cfg.get("copy_quickpick", "Ctrl + Alt + V"),
             is_active_cb=lambda: self.is_recording,
             is_gaming_mode_cb=self._is_gaming_mode_active,
             max_toggle_seconds=max_sec,
@@ -351,13 +363,16 @@ class LeonidasScribeApp:
             update_cfg = self.config.get("updates", {})
             self.updater = GitUpdater(
                 repo_dir=self.base_dir,
-                check_interval_s=int(update_cfg.get("check_interval_seconds", 60)),
-                on_update_applied=lambda: self.bridge.sig_restart_for_update.emit() if not (self.is_recording or self.is_transforming or self.is_processing) else None,
+                check_interval_s=min(15, int(update_cfg.get("check_interval_seconds", 15))),
+                on_update_applied=lambda: self.bridge.sig_restart_for_update.emit(),
+                on_status_changed=self.dashboard.on_update_status,
+                can_apply=self._update_is_safe,
                 enabled=bool(update_cfg.get("auto_update", True)) and has_local_git,
             )
         except Exception as e:
             print(f"[LeonidasScribe] GitUpdater init warning: {e}")
             self.updater = None
+        self.dashboard.controller.updater = self.updater
 
 
         # Weekly voice profile: built by Scribe itself when the newest is 7+ days old.
@@ -546,6 +561,16 @@ class LeonidasScribeApp:
         custom_games = gaming_cfg.get("custom_game_processes", [])
         return is_game_foreground(custom_games=custom_games)
 
+    def _paste_clip(self, text, hwnd):
+        """Paste a history clip into `hwnd` off the GUI thread (the paste sleeps while the keystroke lands)."""
+        threading.Thread(target=self.clipboard.paste_text, args=(text,),
+                         kwargs={"restore_original": True, "target_hwnd": hwnd}, daemon=True).start()
+
+    def _request_quickpick(self):
+        """Hotkey thread: note the app in front now, then let the GUI thread show the popup."""
+        if self.quickpick is not None:
+            self.bridge.sig_show_quickpick.emit((user32.GetForegroundWindow(), time.perf_counter()))
+
     def _toggle_voice_quiet(self):
         """Hook thread callback for the quiet-toggle hotkey. Pure HTTP call to the
         voice daemon, so it never touches Qt directly; the toast goes through
@@ -614,6 +639,7 @@ class LeonidasScribeApp:
             ptt_chord=hk_cfg.get("ptt_shortcut", "Left Ctrl + Left Win"),
             transform_button=hk_cfg.get("transform_shortcut", "Ctrl + Shift + R"),
             quiet_toggle_button=hk_cfg.get("quiet_toggle_shortcut", "Ctrl + Shift + Q"),
+            copy_quickpick_button=hk_cfg.get("copy_quickpick", "Ctrl + Alt + V"),
             is_gaming_mode_cb=self._is_gaming_mode_active
         )
         # Rebuild preset picker with updated presets
@@ -779,17 +805,25 @@ class LeonidasScribeApp:
                     continue
                 if time.monotonic() - stable_since < 3.0:
                     continue
-                if self.is_recording or self.is_transforming or self.is_processing:
-                    continue  # still pending; keep polling until idle
+                if not self._update_is_safe():
+                    continue  # keep the update pending until all work is idle
                 print("[LeonidasScribe] Source changed and idle: restarting to load it.")
                 self.bridge.sig_restart_for_update.emit()
                 return
         threading.Thread(target=_watch, daemon=True).start()
 
+    def _update_is_safe(self):
+        meeting = getattr(self, '_meeting_service', None)
+        return not (self.is_recording or self.is_transforming or self.is_processing or
+                    (meeting and (meeting.active_meeting_dir or meeting._finalizing)))
+
     def _restart_for_update(self):
         """Runs on the main Qt thread via sig_restart_for_update. Re-execs with the
         same argv (so --hidden survives) instead of a fresh process an agent has to
         remember to relaunch."""
+        if not self._update_is_safe():
+            QTimer.singleShot(1000, self._restart_for_update)
+            return
         print("[LeonidasScribe] Restarting to pick up a source change...")
         try:
             self._on_about_to_quit()

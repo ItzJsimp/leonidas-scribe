@@ -60,7 +60,15 @@
     "ptt_shortcut": "Ctrl + Shift + T",
     "cancel_shortcut": "Escape",
     "transform_shortcut": "Ctrl + Shift + A",
-    "quiet_toggle_shortcut": "Ctrl + Shift + Q"
+    "quiet_toggle_shortcut": "Ctrl + Shift + Q",
+    "copy_quickpick": "Ctrl + Alt + V"
+  },
+  "clipboard_share": {
+    "enabled": true,
+    "topic": "scribe-clip-change-me",
+    "my_name": "the user",
+    "partner_name": "Mob",
+    "auto_apply": false
   },
   "presets": [
     {

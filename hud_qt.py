@@ -158,6 +158,9 @@ class FloatingHUDWidget(QWidget):
         self._vh = 0.0
         self.custom_coords = None
         self.live_transcript = ""
+        self._committed = 0          # words in finished Whisper chunks
+        self._pending_s = 0.0        # speech heard since the last chunk landed (its words are not transcribed yet)
+        self._shown = 0              # the live word count: committed plus an estimate for what is still being said
         self.position = "bottom-center"      # or "top-center" (config hud.position)
         self.transcript_mode = "hover"       # "hover" | "always" | "off" (config hud.live_transcript)
         self.target_app = ""
@@ -220,6 +223,11 @@ class FloatingHUDWidget(QWidget):
         """Accurate text from the live Whisper chunks. The pill keeps its size; the
         word count updates and the panel (hover or always) shows the words."""
         self.live_transcript = (text or "").replace("⏸", "\n").strip()
+        now = len(self.live_transcript.split())
+        # a chunk landed: its words are real now, so the speech it covered stops counting as an estimate
+        self._pending_s = max(0.0, self._pending_s - max(0, now - self._committed) / self.WORDS_PER_SPEECH_SECOND)
+        self._committed = now
+        self._shown = now + int(self._pending_s * self.WORDS_PER_SPEECH_SECOND)
         if self.state in ("listening", "capturing"):
             self._fit_listening()
         self.update()
@@ -252,16 +260,18 @@ class FloatingHUDWidget(QWidget):
         self._fit_listening()
         self.update()
 
+    WORDS_PER_SPEECH_SECOND = 2.3   # about 140 words a minute while actually speaking
+
     def word_count(self) -> int:
-        return len(self.live_transcript.split())
+        return self._shown
 
     def _meta_parts(self) -> list:
         secs = int(time.monotonic() - self.started_at) if self.started_at else 0
         parts = [f"{secs // 60}:{secs % 60:02d}"]
         if self.target_app:
             parts.append(self.target_app)
-        if self.live_transcript:
-            parts.append(f"{self.word_count():,} words")
+        if self._shown:
+            parts.append(f"{self._shown:,} words")
         if self._merge_label():
             parts.append(self._merge_label())
         return parts
@@ -397,6 +407,13 @@ class FloatingHUDWidget(QWidget):
                 pass
         if self.state in ("listening", "capturing") and self.anim_tick % 3 == 0:
             self.wave.append(self.live_level)  # ~20 samples a second
+        if self.state in ("listening", "capturing") and self.live_level > 0.12:
+            # words show while you speak, not a Whisper round trip after the pause (it lagged by several seconds)
+            self._pending_s += 0.016
+            est = self._committed + int(self._pending_s * self.WORDS_PER_SPEECH_SECOND)
+            if est > self._shown:
+                self._shown = est
+                self._fit_listening()
 
         if self.state == "transforming" and self.closing_at is None:
             elapsed = time.monotonic() - getattr(self, "transform_started_at", time.monotonic())
@@ -434,6 +451,7 @@ class FloatingHUDWidget(QWidget):
 
     def _start_session(self):
         self.live_transcript = ""
+        self._committed, self._pending_s, self._shown = 0, 0.0, 0
         self.started_at = time.monotonic()
         self.wave = collections.deque([0.0] * self.WAVE_BARS, maxlen=self.WAVE_BARS)
         self.live_level = 0.0

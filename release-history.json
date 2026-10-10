@@ -1,0 +1,10 @@
+[
+  {
+    "version": "0.1.0",
+    "kind": "patch",
+    "notes": "Safe automatic updates, release history, and app notifications.",
+    "source_commit": "8e3c224414d5dcb2ab1c17e070acf21e99625a18",
+    "published_at": "2026-10-10T11:31:49.2532632Z",
+    "channel": "stable"
+  }
+]

@@ -881,8 +881,12 @@ class SettingsView(QWidget):
                 self._set_status(f"Update available ({behind} new commit{'s' if behind > 1 else ''}). Pulling...", "StatOk")
 
                 def pull_done(p_res):
-                    if p_res.get("ok"):
-                        self._set_status(f"Updated to {p_res.get('commit')}. Reloading Scribe...", "StatOk")
+                    if isinstance(p_res, Exception):
+                        self._set_status(f"Update failed: {p_res}", "StatWarn")
+                    elif p_res.get("deferred"):
+                        self._set_status(p_res.get("status", "Update queued until idle"), "StatWarn")
+                    elif p_res.get("ok"):
+                        self._set_status(p_res.get("status", "Update installed. Reloading Scribe..."), "StatOk")
                         self.host.toast("Scribe updated to latest version! Reloading...", "success")
                     else:
                         self._set_status(f"Pull failed: {p_res.get('error')}", "StatWarn")

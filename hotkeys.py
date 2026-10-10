@@ -106,12 +106,14 @@ def stamp_user_input(flags, injected_mask):
 class HotkeyManager:
     def __init__(self, on_ptt_start=None, on_ptt_stop=None, on_toggle_trigger=None,
                  on_capture_trigger=None, on_cancel=None, on_transform_trigger=None,
-                 on_quiet_toggle_trigger=None,
+                 on_quiet_toggle_trigger=None, on_clipboard_send=None,
+                 on_copy_quickpick=None, copy_quickpick_button="Ctrl + Alt + V",
                  is_active_cb=None, is_gaming_mode_cb=None, max_toggle_seconds=300,
                  toggle_debounce_seconds=0.15, toggle_button="Mouse5",
                  secondary_toggle_button=None, capture_button="Mouse4",
                  ptt_chord="Left Ctrl + Left Win", transform_button="Ctrl + Alt + R",
-                 quiet_toggle_button="Ctrl + Shift + Q"):
+                 quiet_toggle_button="Ctrl + Shift + Q",
+                 clipboard_send_button="Ctrl + Shift + C"):
         self.on_ptt_start = on_ptt_start
         self.on_ptt_stop = on_ptt_stop
         self.on_toggle_trigger = on_toggle_trigger
@@ -119,6 +121,8 @@ class HotkeyManager:
         self.on_cancel = on_cancel
         self.on_transform_trigger = on_transform_trigger
         self.on_quiet_toggle_trigger = on_quiet_toggle_trigger
+        self.on_clipboard_send = on_clipboard_send
+        self.on_copy_quickpick = on_copy_quickpick
         self.is_active_cb = is_active_cb
         self.is_gaming_mode_cb = is_gaming_mode_cb
         self.max_toggle_seconds = max_toggle_seconds
@@ -130,6 +134,8 @@ class HotkeyManager:
         self.ptt_chord = ptt_chord or "Left Ctrl + Left Win"
         self.transform_button = transform_button or "Ctrl + Alt + R"
         self.quiet_toggle_button = quiet_toggle_button or "Ctrl + Shift + Q"
+        self.clipboard_send_button = clipboard_send_button or "Ctrl + Shift + C"
+        self.copy_quickpick_button = copy_quickpick_button or "Ctrl + Alt + V"
 
         self.ctrl_down = False
         self.lwin_down = False
@@ -153,17 +159,21 @@ class HotkeyManager:
     def update_bindings(self, toggle_button="Mouse5", capture_button="Mouse4",
                         ptt_chord="Left Ctrl + Left Win", transform_button="Ctrl + Alt + R",
                         secondary_toggle_button=None, is_gaming_mode_cb=None,
-                        quiet_toggle_button="Ctrl + Shift + Q"):
+                        quiet_toggle_button="Ctrl + Shift + Q",
+                        clipboard_send_button="Ctrl + Shift + C",
+                        copy_quickpick_button="Ctrl + Alt + V"):
         self.toggle_button = toggle_button or "Mouse5"
         self.capture_button = capture_button or "Mouse4"
         self.ptt_chord = ptt_chord or "Left Ctrl + Left Win"
         self.transform_button = transform_button or "Ctrl + Alt + R"
         self.quiet_toggle_button = quiet_toggle_button or "Ctrl + Shift + Q"
+        self.clipboard_send_button = clipboard_send_button or "Ctrl + Shift + C"
+        self.copy_quickpick_button = copy_quickpick_button or "Ctrl + Alt + V"
         if secondary_toggle_button is not None:
             self.secondary_toggle_button = secondary_toggle_button
         if is_gaming_mode_cb is not None:
             self.is_gaming_mode_cb = is_gaming_mode_cb
-        print(f"[LeonidasScribe Hotkeys] Bindings live-updated: Toggle={self.toggle_button}, Secondary={self.secondary_toggle_button}, Capture={self.capture_button}, PTT={self.ptt_chord}, Transform={self.transform_button}, QuietToggle={self.quiet_toggle_button}")
+        print(f"[LeonidasScribe Hotkeys] Bindings live-updated: Toggle={self.toggle_button}, Secondary={self.secondary_toggle_button}, Capture={self.capture_button}, PTT={self.ptt_chord}, Transform={self.transform_button}, QuietToggle={self.quiet_toggle_button}, ClipSend={self.clipboard_send_button}")
 
     def _match_key(self, vk, binding_str):
         if not binding_str or binding_str.lower() in ("disabled", "none"):
@@ -235,6 +245,14 @@ class HotkeyManager:
                 elif self._match_key(vk, self.quiet_toggle_button):
                     if self.on_quiet_toggle_trigger:
                         threading.Thread(target=self.on_quiet_toggle_trigger, daemon=True).start()
+                    return 1
+                elif self._match_key(vk, self.clipboard_send_button):
+                    if self.on_clipboard_send:
+                        threading.Thread(target=self.on_clipboard_send, daemon=True).start()
+                    return 1
+                elif self._match_key(vk, self.copy_quickpick_button):
+                    if self.on_copy_quickpick:
+                        threading.Thread(target=self.on_copy_quickpick, daemon=True).start()
                     return 1
 
             # Real typing only: key-downs the dictation hotkeys did not consume above

@@ -25,12 +25,15 @@ class GitUpdater:
         on_update_applied: Optional[Callable[[], None]] = None,
         on_status_changed: Optional[Callable[[str, str], None]] = None,
         enabled: bool = True,
+        can_apply: Optional[Callable[[], bool]] = None,
     ):
         self.repo_dir = os.path.abspath(repo_dir)
         self.check_interval_s = max(15, check_interval_s)
         self.on_update_applied = on_update_applied
         self.on_status_changed = on_status_changed
         self.enabled = enabled
+        self.can_apply = can_apply or (lambda: True)
+        self._announced_status = None
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -144,6 +147,10 @@ class GitUpdater:
                 rev_list = self._run_git(["rev-list", f"{local_head}..{remote_head}", "--count"])
                 behind_count = int(rev_list.stdout.strip() or "1") if rev_list.returncode == 0 else 1
 
+                if behind_count == 0:
+                    self.last_status = "Local build is ahead of the release channel"
+                    return {"ok": True, "update_available": False, "status": self.last_status}
+
                 self.last_status = f"Update available ({behind_count} new commit{'s' if behind_count > 1 else ''})"
                 return {
                     "ok": True,
@@ -170,6 +177,10 @@ class GitUpdater:
         if not self.is_git_repo():
             return {"ok": False, "error": "Not a git repository"}
 
+        if not self.can_apply():
+            self._status("waiting", "Update waiting for dictation or meeting to finish")
+            return {"ok": False, "deferred": True, "status": self.last_status}
+
         with self._lock:
             try:
                 branch_res = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -179,7 +190,14 @@ class GitUpdater:
                 if pull_res.returncode == 0:
                     new_commit = self._get_local_commit()[:7]
                     self.current_commit = new_commit
-                    self.last_status = f"Updated to {new_commit}"
+                    import json
+                    from pathlib import Path
+                    try:
+                        release = json.loads((Path(self.repo_dir) / 'release.json').read_text(encoding='utf-8-sig'))
+                        version = 'v' + release['version']
+                    except (OSError, ValueError, KeyError):
+                        version = new_commit
+                    self._status("applied", f"Updated to {version}")
                     print(f"[LeonidasScribe Updater] Successfully pulled update: {new_commit}")
                     return {"ok": True, "commit": new_commit, "output": pull_res.stdout.strip()}
                 else:
@@ -190,14 +208,27 @@ class GitUpdater:
                 print(f"[LeonidasScribe Updater] Pull exception: {e}")
                 return {"ok": False, "error": str(e)}
 
+    def _status(self, kind, message):
+        self.last_status = message
+        if (kind, message) != self._announced_status:
+            self._announced_status = (kind, message)
+            if self.on_status_changed:
+                self.on_status_changed(kind, message)
+
     def check_and_apply_update(self) -> bool:
         """
         One-shot check and automatic pull if updates exist.
         Returns True if an update was pulled.
         """
         check = self.check_for_updates()
+        self._status("available" if check.get("update_available") else "current" if check.get("ok") else "error", check.get("status", "Check failed"))
         if check.get("update_available"):
+            if not self.can_apply():
+                self._status("waiting", "Update waiting for dictation or meeting to finish")
+                return False
             pull = self.pull_update()
+            if not pull.get("ok"):
+                self._status("error", pull.get("status", "Update failed: " + pull.get("error", "unknown error")))
             if pull.get("ok"):
                 if self.on_update_applied:
                     try:

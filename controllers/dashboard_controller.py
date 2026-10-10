@@ -569,6 +569,8 @@ class DashboardController:
     # --- Git Updates Operations ---
     def check_updates(self) -> dict:
         try:
+            if getattr(self, "updater", None):
+                return self.updater.check_for_updates()
             from updater import GitUpdater
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             updater = GitUpdater(repo_dir=base_dir)
@@ -578,6 +580,9 @@ class DashboardController:
 
     def apply_update(self) -> dict:
         try:
+            if getattr(self, "updater", None):
+                applied = self.updater.check_and_apply_update()
+                return {"ok": applied, "deferred": not applied and "waiting" in self.updater.last_status.lower(), "status": self.updater.last_status}
             from updater import GitUpdater
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             updater = GitUpdater(repo_dir=base_dir)

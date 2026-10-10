@@ -18,6 +18,7 @@ KEEP = 2000  # unpinned clips kept; pinned clips are never pruned
 class ClipStore:
     def __init__(self, path: str):
         self._lock = threading.Lock()
+        self.version = 0  # bumps on every change, so caches (quick-pick) know when to reload
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS clips("
@@ -40,6 +41,7 @@ class ClipStore:
                 (KEEP,),
             )
             self._db.commit()
+            self.version += 1
             return self._db.execute("SELECT id FROM clips WHERE text=?", (text,)).fetchone()[0]
 
     def recent(self, query: str = "", limit: int = 200) -> list[dict]:
@@ -58,11 +60,20 @@ class ClipStore:
         with self._lock:
             self._db.execute("UPDATE clips SET pinned=? WHERE id=?", (int(pinned), clip_id))
             self._db.commit()
+            self.version += 1
 
     def delete(self, clip_id: int):
         with self._lock:
             self._db.execute("DELETE FROM clips WHERE id=?", (clip_id,))
             self._db.commit()
+            self.version += 1
+
+    def clear(self, keep_pinned: bool = True):
+        """Wipe history. Pinned clips are deliberate keepers, so they survive by default."""
+        with self._lock:
+            self._db.execute("DELETE FROM clips WHERE pinned=0" if keep_pinned else "DELETE FROM clips")
+            self._db.commit()
+            self.version += 1
 
 
 def clipboard_is_excluded() -> bool:

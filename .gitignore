@@ -30,3 +30,4 @@ ScribeCapture.exe
 
 # Clipboard history (private, local)
 clipboard.db*
+notifications.db*

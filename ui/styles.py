@@ -214,6 +214,13 @@ QFrame#AchTile[unlocked="true"] { background-color: $gold_soft; border: 1px soli
 QFrame#QuestRow  { background-color: $obsidian_900; border: 1px solid $hairline; border-radius: $r_control; }
 QFrame#QuestRow[done="true"] { background-color: $success_soft; border: 1px solid $success_soft; }
 
+/* ---------- copy ---------- */
+QFrame#ClipRow { background-color: $obsidian_900; border: 1px solid $hairline; border-radius: $r_control; }
+QFrame#ClipRow[sel="true"] { border: 1px solid $cyan; }
+QFrame#ClipRow[pinned="true"] { background-color: $gold_soft; border: 1px solid $gold_soft; }
+QFrame#ClipRow[pinned="true"][sel="true"] { border: 1px solid $cyan; }
+QLabel#ClipText { font-family: $font_mono; font-size: $fs_body; color: $ink; }
+
 /* ---------- status badges: soft fill, matching text ---------- */
 QLabel#Badge, QLabel#BadgeCyan, QLabel#BadgeGold, QLabel#BadgeSuccess, QLabel#BadgeError, QLabel#BadgeCrimson {
     font-family: $font_mono; font-size: $fs_micro; font-weight: 600;
@@ -294,8 +301,27 @@ QFrame#PillIsland, QFrame#PillCapsule {
 QFrame#PillPanel {
     background-color: $island;
     border: 1px solid $island_ring;
-    border-radius: $r_panel;
+    border-radius: 18px;  /* same as the island: the panel grows out of it without a corner jump */
 }
+QFrame#DatePopup {
+    background-color: $obsidian_850;
+    border: 1px solid $obsidian_600;
+    border-radius: $r_card;
+}
+QPushButton#DayBtn {
+    background-color: transparent; color: $ink; border: 1px solid transparent;
+    border-radius: 8px; padding: 0; min-height: 0; font-family: $font_mono; font-size: $fs_label;
+}
+QPushButton#DayBtn:hover { background-color: $obsidian_800; }
+QPushButton#DayBtn[out="true"] { color: $ink_dim; }
+QPushButton#DayBtn[today="true"] { border: 1px solid $obsidian_600; }
+QPushButton#DayBtn[sel="true"] { background-color: $cyan_soft; color: $cyan; border: 1px solid $cyan; }
+QPushButton#DateField {
+    background-color: $obsidian_900; color: $ink; border: 1px solid $obsidian_700;
+    border-radius: $r_control; padding: 7px 10px; font-size: $fs_body; min-height: 18px; text-align: left;
+}
+QPushButton#DateField:hover { border-color: $obsidian_600; }
+QPushButton#DateField:focus { border: 1px solid $cyan; }
 QFrame#CallPromptToast {
     background-color: $obsidian_850;
     border: 1px solid $obsidian_600;
@@ -307,7 +333,7 @@ QFrame#Card[selected="true"] { border: 1px solid $cyan; }
 QLabel#SheetTitle  { font-family: $font_display; font-size: $fs_heading; font-weight: 800; color: $ink; }
 QLabel#Speaker     { font-size: $fs_body; font-weight: 600; color: $ink; }
 QLabel#NumCyan     { font-family: $font_mono; font-size: $fs_body; color: $cyan; }
-QLabel#PillTime    { font-family: $font_mono; font-size: $fs_title; font-weight: 600; color: $ink; }
+QLabel#PillTime    { font-family: $font_mono; font-size: 12px; font-weight: 500; color: $ink; }  /* hud_qt font_meta */
 QLabel#Chip {
     font-size: $fs_label; font-weight: 600; color: $ink_muted;
     background-color: $obsidian_800; border: 1px solid $obsidian_700;
@@ -318,9 +344,10 @@ QLabel#Avatar {
     background-color: $obsidian_800; border: 1px solid $obsidian_600; border-radius: 10px;
 }
 QLabel#BulletDot { background-color: $cyan; border-radius: 2px; }
-QLabel#RecDot { background-color: $crimson_text; border-radius: 5px; }
+QLabel#RecDot { background-color: $crimson_text; border-radius: 4px; }
 QLabel#RecDot[state="paused"] { background-color: $gold; }
 QLabel#RecDot[state="dead"]   { background-color: $error; }
+QLabel#RecDot[state="buffer"] { background-color: $ink_dim; }
 QLabel#RecDot[state="saving"] { background-color: $gold; }
 QLabel#RecDot[state="ready"]  { background-color: $success; }
 QLabel#AskQuestion {

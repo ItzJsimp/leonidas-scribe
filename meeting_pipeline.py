@@ -46,14 +46,14 @@ class MeetingChunker:
     MIN_VOICED_S = 0.4
     ENERGY_FLOOR = 55.0
 
-    def __init__(self, track: str, on_chunk, sample_rate: int = SAMPLE_RATE):
+    def __init__(self, track: str, on_chunk, sample_rate: int = SAMPLE_RATE, start_s: float = 0.0):
         self.track = track
         self.on_chunk = on_chunk
         self.sr = sample_rate
         self.blocks: list[np.ndarray] = []
         self.rms: list[float] = []
         self.block_durations: list[float] = []
-        self.cursor_s = 0.0
+        self.cursor_s = start_s  # a resumed meeting chunks only the new audio, on the same timeline
         self.voiced_s = 0.0
         self.quiet_s = 0.0
         self.sent_seconds = 0.0
@@ -369,16 +369,54 @@ def drop_dictation_words(chunks: list, spans: list, margin: float = DICTATION_MA
 
 def dictation_spans_for(meeting_dir: str, manifest: dict, store_root: str) -> list:
     """Scribe dictation spans during this recording, on the audio timeline (wall - record start).
-    Pause gaps are not subtracted; a resumed meeting may shift by the gap length."""
-    w0 = float(manifest.get("record_started_wall") or 0.0)
-    if not w0:
+    One window per recording session (mr.meeting_sessions), so a meeting resumed days later never reads the dictations
+    made between its sessions as part of the call."""
+    if not float(manifest.get("record_started_wall") or 0.0):
         return []
     ended = manifest.get("ended")
     try:
-        w1 = datetime.datetime.fromisoformat(ended).timestamp() if ended else time.time()
+        w_end = datetime.datetime.fromisoformat(ended).timestamp() if ended else time.time()
     except (TypeError, ValueError):
-        w1 = time.time()
-    return [(round(s - w0, 3), round(e - w0, 3)) for s, e in mr.read_dictation_spans(store_root, w0, w1)]
+        w_end = time.time()
+    out = []
+    for w0, w1, a0 in mr.meeting_sessions(manifest):
+        for s, e in mr.read_dictation_spans(store_root, w0, w1 or w_end):
+            out.append((round(a0 + s - w0, 3), round(a0 + e - w0, 3)))
+    return out
+
+
+PHANTOM_PHRASES = {"thank you.", "thank you", "thanks for watching.", "outro", "bye.", "bye", "you", "you.", "mm-hmm.", "mm-hmm"}
+
+
+def noise_reason(ch: dict) -> str | None:
+    """Why a chunk is Whisper noise, or None. Whisper writes speech for silence, music and room hum: a word repeated
+    dozens of times, a stock phrase over a long quiet chunk, letters from a language nobody is speaking."""
+    text = (ch.get("text") or "").strip()
+    if not text:
+        return None
+    words = text.split()
+    dur = max(0.1, _num(ch.get("t1")) - _num(ch.get("t0")))
+    norm = [w.lower().strip(".,!?;:") for w in words]
+    if len(words) >= 12 and len(set(norm)) / len(words) < 0.3:
+        return "repeat"
+    letters = [c for c in text if c.isalpha()]
+    if letters and (any(c in "þðÞÐ" for c in text) or sum(1 for c in letters if ord(c) > 0x24F) / len(letters) > 0.3):
+        return "foreign"
+    if dur >= 8 and len(words) <= 4 and text.lower() in PHANTOM_PHRASES:
+        return "phantom"
+    return None
+
+
+def drop_noise_chunks(chunks: list) -> tuple:
+    kept, dropped = [], []
+    for ch in chunks:
+        why = noise_reason(ch)
+        if why:
+            dropped.append({"t0": ch.get("t0"), "t1": ch.get("t1"), "track": ch.get("track"), "why": why,
+                            "text": (ch.get("text") or "")[:160]})
+        else:
+            kept.append(ch)
+    return kept, dropped
 
 
 def stitch_and_polish(
@@ -393,6 +431,9 @@ def stitch_and_polish(
     """attribute_fn(chunk) -> list of chunk-shaped pieces (speaker_key/confidence/overlap set); used for Them chunks only.
     exclude: [(t0, t1)] on the meeting timeline whose me-track words are left out (Scribe dictations)."""
     chunks = sorted(read_chunks_jsonl(meeting_dir), key=lambda c: float(c.get("t0", 0.0)))
+    chunks, noise = drop_noise_chunks(chunks)
+    if noise:
+        mr._atomic_write_json(os.path.join(meeting_dir, "dropped_noise.json"), noise)  # what was left out, and why
     if exclude:
         chunks, dropped = drop_dictation_words(chunks, exclude)
         mr._atomic_write_json(os.path.join(meeting_dir, "excluded.json"),
@@ -420,8 +461,17 @@ def stitch_and_polish(
                 }
             )
     segments = polish_windows(raw_segments, dict_data=dict_data, llm_polish_fn=llm_polish_fn)
+    segments.sort(key=lambda s: float(s.get("t0", 0.0)))  # the two tracks interleave: one global clock order
     mr._atomic_write_json(os.path.join(meeting_dir, "transcript.json"), segments, fsync=True)
     return segments
+
+
+def _read_int(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def finalize_opus(meeting_dir: str) -> dict:
@@ -440,18 +490,36 @@ def finalize_opus(meeting_dir: str) -> dict:
             return
         infos = [sf.info(f) for f in seg_files]
         sr = infos[0].samplerate if infos else SAMPLE_RATE
-        expected_frames = sum(i.frames for i in infos)
-        expected_dur = expected_frames / float(sr)
-        if os.path.exists(opus_path) and os.path.getsize(opus_path) and sf.info(opus_path).duration >= expected_dur - 0.5:
-            # a crash between verify and delete left some FLAC behind: the Opus already holds it all,
-            # re-encoding the leftovers would replace a good file with a truncated one
+        idx_path = opus_path + ".idx"  # highest segment number already inside the Opus
+        done_idx = _read_int(idx_path)
+        have_opus = os.path.exists(opus_path) and os.path.getsize(opus_path) > 0
+        seg_no = [int(re.search(r"seg-(\d+)\.flac$", os.path.basename(f)).group(1)) for f in seg_files]
+        prior = None
+        if have_opus and done_idx is not None:
+            fresh = [f for f, n in zip(seg_files, seg_no) if n > done_idx]
+            if not fresh:  # a crash between verify and delete left encoded FLAC behind
+                for fpath in seg_files:
+                    os.remove(fpath)
+                result[f"{track}_opus"] = opus_path
+                result[f"{track}_duration"] = round(sf.info(opus_path).duration, 3)
+                return
+            # An earlier finalize ran while the call was still recording (2026-10-10: ~11 minutes were deleted as
+            # "already encoded"). The Opus holds a prefix only: append the newer segments to it.
+            prior = sf.read(opus_path, dtype="int16")[0]
+            seg_files, seg_no = fresh, [n for n in seg_no if n > done_idx]
+            infos = [sf.info(f) for f in seg_files]
+        elif have_opus and sf.info(opus_path).duration >= sum(i.frames for i in infos) / float(sr) - 0.5:
+            # legacy Opus with no index file: keep the old duration rule (crash between verify and delete)
             for fpath in seg_files:
                 os.remove(fpath)
             result[f"{track}_opus"] = opus_path
             result[f"{track}_duration"] = round(sf.info(opus_path).duration, 3)
             return
+        expected_frames = sum(i.frames for i in infos) + (len(prior) if prior is not None else 0)
+        expected_dur = expected_frames / float(sr)
         # int16, header read-back: float32 + a full decode held several GB on a 2 h call (two tracks at once)
-        full_audio = np.concatenate([sf.read(f, dtype="int16")[0] for f in seg_files])
+        parts = ([prior] if prior is not None else []) + [sf.read(f, dtype="int16")[0] for f in seg_files]
+        full_audio = np.concatenate(parts)
         tmp_opus = opus_path + ".tmp"
         sf.write(tmp_opus, full_audio, sr, format="OGG", subtype="OPUS")
         del full_audio
@@ -463,6 +531,8 @@ def finalize_opus(meeting_dir: str) -> dict:
             raise RuntimeError(
                 f"Opus read-back verification failed for {opus_path}: expected {expected_dur:.2f}s, got {actual_dur:.2f}s"
             )
+        with open(idx_path, "w", encoding="utf-8") as f:
+            f.write(str(max(seg_no)))
         for fpath in seg_files:
             os.remove(fpath)
         result[f"{track}_opus"] = opus_path
@@ -736,6 +806,21 @@ def _read_track(meeting_dir: str, track: str) -> np.ndarray:
     return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
 
 
+def resume_floor(meeting_dir: str, track: str):
+    """(segment files after the floor, seconds skipped). A user-resumed meeting already has chunks for everything
+    before its floor; its audio was rebuilt from Opus, so chunking it again could cut at different pauses and
+    duplicate the old transcript. Only audio recorded after the resume is chunked."""
+    m = mr.read_manifest(meeting_dir) or {}
+    floor = max([float(p.get("floor_s") or 0.0) for p in m.get("resume_points") or []] or [0.0])
+    files, skipped, n = mr._segment_files(meeting_dir, track), 0.0, 0
+    for path in files:
+        d = float(sf.info(path).duration)
+        if skipped + d > floor + 0.01:
+            break
+        skipped, n = skipped + d, n + 1
+    return files[n:], skipped, n
+
+
 def _transcribe_missing(meeting_dir: str, stt, sample_rate: int = SAMPLE_RATE) -> int:
     """Chunk both tracks' FLAC segments and transcribe chunks not yet in chunks.jsonl. Returns failed-chunk count."""
     done = {(r.get("track"), round(_num(r.get("t0")), 3), round(_num(r.get("t1")), 3)) for r in read_chunks_jsonl(meeting_dir)}
@@ -752,9 +837,10 @@ def _transcribe_missing(meeting_dir: str, stt, sample_rate: int = SAMPLE_RATE) -
                 return
             append_chunk_jsonl(meeting_dir, {"track": track, "t0": t0, "t1": t1, "text": res.get("text", ""), "words": res.get("words", [])})
 
-        chunker = MeetingChunker(track=track, on_chunk=on_chunk, sample_rate=sample_rate)
+        files, skipped_s, _n = resume_floor(meeting_dir, track)
+        chunker = MeetingChunker(track=track, on_chunk=on_chunk, sample_rate=sample_rate, start_s=skipped_s)
         step = int(sample_rate * 0.1)
-        for path in mr._segment_files(meeting_dir, track):
+        for path in files:
             data, _sr = sf.read(path, dtype="int16")
             for i in range(0, len(data), step):
                 chunker.push(data[i : i + step])
@@ -789,8 +875,10 @@ class LiveTranscriber:
         self.dir, self.stt, self.interval, self.sr = meeting_dir, stt, interval, sample_rate
         self.done = {(r.get("track"), round(_num(r.get("t0")), 3), round(_num(r.get("t1")), 3))
                      for r in read_chunks_jsonl(meeting_dir)}
-        self.fed = {t: 0 for t in self.TRACKS}
-        self.chunkers = {t: MeetingChunker(t, (lambda t0, t1, pcm, t=t: self._on_chunk(t, t0, t1, pcm)), sample_rate)
+        floors = {t: resume_floor(meeting_dir, t) for t in self.TRACKS}
+        self.fed = {t: floors[t][2] for t in self.TRACKS}  # segments before a resume floor are already transcribed
+        self.chunkers = {t: MeetingChunker(t, (lambda t0, t1, pcm, t=t: self._on_chunk(t, t0, t1, pcm)), sample_rate,
+                                           start_s=floors[t][1])
                          for t in self.TRACKS}
         self.calls = self.failed = 0
         self._lock = threading.Lock()
@@ -865,7 +953,7 @@ def _load_speaking_events(meeting_dir: str, manifest: dict, store_root: str) -> 
             except ValueError:
                 continue  # torn last line after a crash
             if off and ev.get("wall") is not None:
-                ev["t"] = max(0.0, _num(ev["wall"]) - _num(off))
+                ev["t"] = mr.wall_to_audio(manifest, _num(ev["wall"]))
             events.append(ev)
     for uid in sorted({str(e.get("user_id")) for e in events if e.get("event") in ("start", "stop")}):
         remembered = ms.lookup_remembered_discord_name(store_root, uid)
