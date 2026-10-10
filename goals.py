@@ -321,7 +321,7 @@ def events(prev: dict | None, snap: dict) -> list:
     if rec > prev.get("record", 0) and rec >= DEEP_WORDS and prev.get("record", 0) > 0:
         out.append({"kind": "record", "size": 2, "title": "New record prompt", "body": f"{rec:,} words in one go"})
     if snap["last_t"] and snap["last_t"] != prev.get("last_t") and snap["last_row_xp"] >= 10:
-        out.append({"kind": "xp", "size": 0, "title": f"+{snap['last_row_xp']} XP",
+        out.append({"kind": "xp", "size": 0, "title": f"+{snap['last_row_xp']} XP", "xp": snap["last_row_xp"],
                     "body": "Deep prompt" if snap["last_row_deep"] else ""})
     out.sort(key=lambda e: -e["size"])
     return out

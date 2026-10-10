@@ -136,7 +136,7 @@ import hotkeys
 import stitch
 import edit_learner
 from hotkeys import HotkeyManager
-from hud_qt import FloatingHUDWidget, QtFloatingHUD, AudioFeedback
+from hud_qt import FloatingHUDWidget, QtFloatingHUD, AudioFeedback, xp_tier
 from card_qt import LeonidasCardWidget
 from live_transcriber import LiveTranscriber
 from ui import labels as ui_labels, load_brand_fonts, motion, get_app_icon
@@ -269,6 +269,8 @@ class LeonidasScribeApp:
             state_provider=self._engine_state,
         )
         self.bridge.sig_history_updated.connect(self.dashboard.refresh_history)
+        # +XP rises out of the Island pill instead of a separate floater (picked 2026-10-09)
+        self.dashboard.celebrator.xp_sink = lambda ev: self.hud.show_xp(ev.get("title", ""), xp_tier(ev))
         self.bridge.sig_alert.connect(self.dashboard.notify)
         self._latency_window = collections.deque(maxlen=20)
         self._last_latency_alert = 0.0
@@ -1293,6 +1295,7 @@ class LeonidasScribeApp:
             else:
                 # Standard Dictation with App Lens
                 lens = getattr(self, "active_lens", "prose")
+                self.bridge.sig_hud_call.emit("show_polishing", ())
                 t0_pol = time.perf_counter()
 
                 # Sequential dictation context check: stitch.should_merge applies every guard

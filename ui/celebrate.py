@@ -1,11 +1,13 @@
 """
-Celebrations: confetti, a banner and "+XP" floaters that burst out of the dictation pill.
+Celebrations: confetti and a banner that burst out of the dictation pill for milestones.
 
 One click-through, never-focused overlay window sits just above where the HUD pill lives
 (bottom-centre of the primary screen, or top-centre when hud.position says so), so the reward
 lands where the eye already is after a dictation and typing into the agent is never touched.
 Events play one after another from a queue. Calm mode keeps the banner and drops the motion;
-a game in the foreground holds big events for a minute and drops "+XP" floaters.
+a game in the foreground holds big events for a minute and drops "+XP".
+Per-dictation "+XP" is not drawn here: Celebrator hands it to xp_sink, and the Island pill
+(hud_qt.FloatingHUDWidget.show_xp) raises it out of the success state (2026-10-09).
 """
 import math
 import os
@@ -17,7 +19,7 @@ from PySide6.QtWidgets import QWidget, QApplication
 
 from . import motion
 from .icons import glyph_icon
-from .styles import T, FONT_DISPLAY, FONT_SANS, FONT_MONO
+from .styles import T, FONT_DISPLAY, FONT_SANS
 
 W, H = 1040, 760          # overlay size; the pill anchor sits at the bottom middle
 CONFETTI = ("crimson", "cyan", "gold", "success", "white", "gold")
@@ -138,24 +140,8 @@ class CelebrationOverlay(QWidget):
             else:
                 p.drawRoundedRect(QRectF(-w / 2, -q["h"] / 2, w, q["h"]), 1.5, 1.5)
             p.restore()
-        if self.ev.get("kind") == "xp":
-            self._paint_xp(p, t)
-        else:
-            self._paint_banner(p, t, fade)
+        self._paint_banner(p, t, fade)
         p.end()
-
-    def _paint_xp(self, p: QPainter, t: float):
-        # subtle by request (2026-10-09): small, no box, off to the pill's right, short drift and fade
-        a = self.anchor()
-        rise = 16 * (1 - (1 - t) ** 3)
-        y = a.y() + (rise + 6 if self.top else -rise - 6)
-        p.setOpacity(0.8 * min(1.0, t * 8) * (1.0 if t < 0.55 else max(0.0, (1 - t) / 0.45)))
-        deep = bool(self.ev.get("body"))
-        f = QFont(FONT_MONO, 9)
-        f.setWeight(QFont.Weight.DemiBold)
-        p.setFont(f)
-        p.setPen(QColor(T["gold"] if deep else T["ink_muted"]))
-        p.drawText(QPointF(a.x() + 150, y), self.ev["title"])
 
     def _paint_banner(self, p: QPainter, t: float, fade: float):
         ev = self.ev
@@ -231,6 +217,7 @@ class Celebrator:
         self.queue = []
         self.overlay = None
         self.busy = False
+        self.xp_sink = None  # callable(ev) on the GUI thread; the dictation pill shows +XP
 
     def _g(self) -> dict:
         return (self.cfg_fn() or {}).get("goals") or {}
@@ -239,11 +226,17 @@ class Celebrator:
         g = self._g()
         if not g.get("enabled", True) or not g.get("celebrations", True):
             return
-        if not g.get("xp_popups", True):
-            evs = [e for e in evs if e.get("kind") != "xp"]
-        # a burst of big news: keep the best 4 plus the xp floater so it never turns into a slideshow
+        xp = [e for e in evs if e.get("kind") == "xp"][:1]
+        if xp and g.get("xp_popups", True) and self.xp_sink and not _gaming():
+            try:
+                self.xp_sink(xp[0])  # now, not queued: it belongs to the paste that just landed
+            except Exception as e:
+                print(f"[Celebrate] xp sink failed: {e}")
+        # a burst of big news: keep the best 4 so it never turns into a slideshow
         big = [e for e in evs if e.get("kind") != "xp"][:4]
-        self.queue += big + [e for e in evs if e.get("kind") == "xp"][:1]
+        if not big:
+            return
+        self.queue += big
         if not self.busy:
             self._next()
 
@@ -252,12 +245,8 @@ class Celebrator:
             self.busy = False
             return
         if _gaming():
-            self.queue = [e for e in self.queue if e.get("kind") != "xp"]
-            if self.queue:
-                self.busy = True
-                QTimer.singleShot(60_000, self._next)
-            else:
-                self.busy = False
+            self.busy = True
+            QTimer.singleShot(60_000, self._next)
             return
         self.busy = True
         ev = self.queue.pop(0)
