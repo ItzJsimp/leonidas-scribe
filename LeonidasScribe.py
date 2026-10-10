@@ -842,6 +842,7 @@ class LeonidasScribeApp:
         self.is_recording = True
         self.current_mode = mode
         self._recording_started_at = time.perf_counter()
+        self._dictation_wall0 = time.time()  # meetings drop me-track words inside this span
 
         # Save active window info
         win_info = get_active_window_info()
@@ -869,10 +870,18 @@ class LeonidasScribeApp:
         # Pre-warm TLS connections to Groq/Cerebras during speech so sockets are hot on stop
         self.engine.prewarm_connections()
 
+    def _log_dictation_span(self):
+        t0 = getattr(self, "_dictation_wall0", 0.0)
+        if t0:
+            import meeting_recorder
+            meeting_recorder.log_dictation_span(meeting_recorder.default_store_root(), t0, time.time())
+            self._dictation_wall0 = 0.0
+
     def _handle_stop_recording(self):
         if not self.is_recording:
             return
         self.is_recording = False
+        self._log_dictation_span()
         if hasattr(self, "_reply_stop_timer") and self._reply_stop_timer.isActive():
             self._reply_stop_timer.stop()
         print(f"[LeonidasScribe] Recording stopped ({self.current_mode.upper()}). Processing...")
@@ -971,6 +980,7 @@ class LeonidasScribeApp:
         reply_data = getattr(self, "_active_reply_data", None)
         self._active_reply_data = None
         self.is_recording = False
+        self._log_dictation_span()
         self.live.cancel()
         wav_bytes = self.recorder.stop()
         self.audio_feedback.play_error()

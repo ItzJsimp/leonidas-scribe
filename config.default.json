@@ -156,6 +156,7 @@
     "call_prompts": true,
     "app_prompts": {},
     "retention_days": 30,
+    "exclude_dictation": true,
     "destinations": [],
     "discord": {
       "client_id": "1549384780116795502",

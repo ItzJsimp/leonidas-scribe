@@ -421,9 +421,13 @@ class SettingsView(QWidget):
         card, b = make_card("Meetings & call prompts", "Capture two-track audio and speaker notes from calls.")
         self.chk_meetings_enabled = QCheckBox("Enable meeting recording")
         self.cb_call_prompt_mode = _combo(["prompt (ask before recording)", "discord_auto (auto-record Discord)", "off (manual only)"])
+        self.chk_exclude_dictation = QCheckBox("Keep dictations out")
         b.addWidget(setting_group([
             setting_row("Meeting recording", self.chk_meetings_enabled, "Record incoming and outgoing call audio into structured transcripts."),
             setting_row("Call prompt mode", self.cb_call_prompt_mode, "Prompt before recording, automatically record Discord voice, or manual only."),
+            setting_row("Scribe dictations", self.chk_exclude_dictation,
+                        "Leave what you dictate with Scribe during a meeting out of its transcript. The audio keeps "
+                        "everything; removed words are listed in the meeting's excluded.json."),
         ]))
         v.addWidget(card)
 
@@ -532,6 +536,7 @@ class SettingsView(QWidget):
             "groq_api_key_backup": self.in_groq_backup_key.text().strip(),
             "gemini_api_key": self.in_gemini_key.text().strip(),
             "meetings_enabled": self.chk_meetings_enabled.isChecked(),
+            "exclude_dictation": self.chk_exclude_dictation.isChecked(),
             "call_prompt_mode": self.cb_call_prompt_mode.currentText(),
             "meeting_dest": self.cb_meeting_dest.currentText(),
             "meeting_retention": self.cb_meeting_retention.currentText(),
@@ -625,6 +630,7 @@ class SettingsView(QWidget):
 
         m_cfg = cfg.get("meetings", {})
         self.chk_meetings_enabled.setChecked(m_cfg.get("enabled", True))
+        self.chk_exclude_dictation.setChecked(m_cfg.get("exclude_dictation", True))
         pm = m_cfg.get("prompt_mode", "prompt" if m_cfg.get("call_prompts", True) else "off")
         idx_pm = 0 if "prompt" in pm else 1 if "auto" in pm else 2
         self.cb_call_prompt_mode.setCurrentIndex(idx_pm)
@@ -681,6 +687,7 @@ class SettingsView(QWidget):
         audio.update({k: v[k] for k in ("device_index", "max_record_seconds", "sound_feedback", "earcon_volume")})
         m_cfg = cfg.setdefault("meetings", {})
         m_cfg["enabled"] = v["meetings_enabled"]
+        m_cfg["exclude_dictation"] = v["exclude_dictation"]
         p_mode = "off" if "off" in v["call_prompt_mode"].lower() else "discord_auto" if "auto" in v["call_prompt_mode"].lower() else "prompt"
         m_cfg["call_prompts"] = p_mode != "off"
         m_cfg["prompt_mode"] = p_mode

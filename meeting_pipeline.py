@@ -9,6 +9,7 @@ Handles:
 - Cost logging in manifest.json (<= $0.09/hr Discord, <= $0.12 gate)
 """
 import argparse
+import datetime
 import getpass
 import io
 import json
@@ -318,6 +319,59 @@ def polish_windows(segments: list[dict], dict_data: dict | None = None, llm_poli
     return polished
 
 
+DICTATION_MARGIN_S = 0.3
+
+
+def drop_dictation_words(chunks: list, spans: list, margin: float = DICTATION_MARGIN_S):
+    """Remove me-track words that fall inside a dictation span. Chunks run 10-30 s, so a dictation is
+    cut out word by word rather than losing the meeting speech around it. A chunk without word
+    timings goes only when a span covers most of it. Returns (chunks, dropped) where dropped lists
+    {t0, t1, text} so the text can be restored (chunks.jsonl itself is never edited)."""
+    def inside(t0, t1):
+        mid = (t0 + t1) / 2.0
+        return any(s - margin <= mid <= e + margin for s, e in spans)
+
+    out, dropped = [], []
+    for ch in chunks:
+        if ch.get("track") != "me":
+            out.append(ch)
+            continue
+        t0, t1 = float(ch.get("t0", 0.0)), float(ch.get("t1", 0.0))
+        words = ch.get("words") or []
+        if not words:
+            covered = sum(max(0.0, min(t1, e + margin) - max(t0, s - margin)) for s, e in spans)
+            if t1 > t0 and covered / (t1 - t0) > 0.5:
+                dropped.append({"t0": t0, "t1": t1, "text": ch.get("text", "")})
+            else:
+                out.append(ch)
+            continue
+        keep = [w for w in words if not inside(float(w.get("t0", t0)), float(w.get("t1", t1)))]
+        gone = [w for w in words if w not in keep]
+        if not gone:
+            out.append(ch)
+            continue
+        dropped.append({"t0": float(gone[0].get("t0", t0)), "t1": float(gone[-1].get("t1", t1)),
+                        "text": " ".join(w.get("w", "") for w in gone)})
+        if keep:
+            out.append(dict(ch, words=keep, text=" ".join(w.get("w", "") for w in keep),
+                            t0=float(keep[0].get("t0", t0)), t1=float(keep[-1].get("t1", t1))))
+    return out, dropped
+
+
+def dictation_spans_for(meeting_dir: str, manifest: dict, store_root: str) -> list:
+    """Scribe dictation spans during this recording, on the audio timeline (wall - record start).
+    Pause gaps are not subtracted; a resumed meeting may shift by the gap length."""
+    w0 = float(manifest.get("record_started_wall") or 0.0)
+    if not w0:
+        return []
+    ended = manifest.get("ended")
+    try:
+        w1 = datetime.datetime.fromisoformat(ended).timestamp() if ended else time.time()
+    except (TypeError, ValueError):
+        w1 = time.time()
+    return [(round(s - w0, 3), round(e - w0, 3)) for s, e in mr.read_dictation_spans(store_root, w0, w1)]
+
+
 def stitch_and_polish(
     meeting_dir: str,
     me_speaker: str = "Me",
@@ -325,9 +379,15 @@ def stitch_and_polish(
     dict_data: dict | None = None,
     llm_polish_fn=None,
     attribute_fn=None,
+    exclude: list | None = None,
 ) -> list[dict]:
-    """attribute_fn(chunk) -> list of chunk-shaped pieces (speaker_key/confidence/overlap set); used for Them chunks only."""
+    """attribute_fn(chunk) -> list of chunk-shaped pieces (speaker_key/confidence/overlap set); used for Them chunks only.
+    exclude: [(t0, t1)] on the meeting timeline whose me-track words are left out (Scribe dictations)."""
     chunks = sorted(read_chunks_jsonl(meeting_dir), key=lambda c: float(c.get("t0", 0.0)))
+    if exclude:
+        chunks, dropped = drop_dictation_words(chunks, exclude)
+        mr._atomic_write_json(os.path.join(meeting_dir, "excluded.json"),
+                              {"reason": "scribe dictation", "spans": [list(s) for s in exclude], "dropped": dropped})
     raw_segments = []
     for ch in chunks:
         text = (ch.get("text") or "").strip()
@@ -838,11 +898,13 @@ def _finalize_meeting_unlocked(
         tpath = os.path.join(meeting_dir, "transcript.json")
         if not os.path.exists(tpath):
             me_name = ((cfg.get("user") or {}).get("name") or "").strip() or getpass.getuser()
+            exclude_on = (cfg.get("meetings") or {}).get("exclude_dictation", True)
             stitch_and_polish(
                 meeting_dir,
                 me_speaker=me_name,
                 llm_polish_fn=polish_fn if polish_fn is not None else make_polish_fn(cfg),
                 attribute_fn=make_attribute_fn(meeting_dir, manifest, store_root),
+                exclude=dictation_spans_for(meeting_dir, manifest, store_root) if exclude_on else None,
             )
         segments = mr._read_json(tpath) or []
         _merge_participants(meeting_dir, manifest, store_root)

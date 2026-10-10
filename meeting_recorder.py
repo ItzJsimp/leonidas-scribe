@@ -56,6 +56,52 @@ def _read_json(path: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Dictation spans: Scribe dictations share the mic with a meeting's me track. The app logs each
+# dictation's wall-clock span here; finalize drops me-track words inside them (meetings.exclude_dictation).
+# ---------------------------------------------------------------------------
+DICTATIONS_FILE = "dictations.jsonl"
+DICTATIONS_MAX_BYTES = 256 * 1024
+
+
+def default_store_root() -> str:
+    return os.environ.get("SCRIBE_MEETINGS_DIR") or os.path.join(HERE, "meetings")
+
+
+def log_dictation_span(store_root: str, start_wall: float, end_wall: float) -> None:
+    """Append one span; trims itself to the newest 2000 lines past 256 KB. Never raises."""
+    try:
+        os.makedirs(store_root, exist_ok=True)
+        path = os.path.join(store_root, DICTATIONS_FILE)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"start": round(start_wall, 3), "end": round(end_wall, 3)}) + "\n")
+        if os.path.getsize(path) > DICTATIONS_MAX_BYTES:
+            with open(path, encoding="utf-8") as f:
+                keep = f.readlines()[-2000:]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+    except OSError:
+        pass
+
+
+def read_dictation_spans(store_root: str, w0: float, w1: float) -> list:
+    """[(start_wall, end_wall)] that overlap [w0, w1]."""
+    out = []
+    try:
+        with open(os.path.join(store_root, DICTATIONS_FILE), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    s, e = float(d["start"]), float(d["end"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if e > w0 and s < w1:
+                    out.append((s, e))
+    except OSError:
+        pass
+    return out
+
+
 def init_meeting_dir(
     meeting_dir: str,
     title: str = "Meeting",
