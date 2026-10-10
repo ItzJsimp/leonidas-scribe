@@ -461,6 +461,122 @@ def decline_resume(meeting_dir: str, pipeline_fn=None) -> dict:
     return manifest
 
 
+def _note_capture_restart(meeting_dir: str, at_s: float, cap) -> None:
+    man = read_manifest(meeting_dir) or {}
+    man.setdefault("capture_restarts", []).append(
+        {"t": round(at_s, 1), "pid": cap.src.get("pid"), "error": cap.error or "capture helper exited"})
+    write_manifest(meeting_dir, man)
+
+
+class CallCapture:
+    """ScribeCapture.exe drained on its own thread into a bounded buffer, read like MicCapture.
+
+    Paid 2026-10-09: the worker read the pipe inline and then slept, so it ran ~0.6% slower than
+    real time; the 4 KB pipe filled, ScribeCapture blocked on write, its wall-clock zero fill took
+    over and after ~2 minutes the call track was silence (meetings 2003 and 2123). Draining here
+    keeps the helper unblocked. If the helper exits (stream invalidated, Discord restarted), the
+    worker respawns it, re-resolving Discord's pid."""
+
+    MAX_BUFFER_S = 2.0
+    RETRY_S = 3.0
+
+    def __init__(self, src: dict, exe: str | None = None):
+        self.src = dict(src or {})
+        self.exe = exe or os.path.join(HERE, "ScribeCapture.exe")
+        self.proc = None
+        self.error = ""
+        self.restarts = 0
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._next_try = 0.0
+
+    def _args(self):
+        if self.src.get("kind") == "app" and self.src.get("pid"):
+            return [self.exe, "--pid", str(self.src["pid"])]
+        return [self.exe, "--device", str(self.src.get("device") or "default")]
+
+    def _refresh_pid(self):
+        if self.src.get("kind") != "app" or (self.src.get("app") or "").lower() != "discord":
+            return
+        try:
+            import meeting_service as msvc  # lazy: meeting_service imports this module
+
+            ds = msvc.discord_source(msvc.list_audio_sessions())
+            if ds:
+                self.src["pid"] = ds["pid"]
+        except Exception:
+            pass
+
+    def start(self) -> bool:
+        if not os.path.exists(self.exe):
+            return False
+        try:
+            self.proc = subprocess.Popen(
+                self._args(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0,
+            )
+        except OSError as e:
+            self.proc, self.error = None, str(e)
+            return False
+        proc = self.proc
+        threading.Thread(target=self._pump, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._drain_err, args=(proc,), daemon=True).start()
+        return True
+
+    def _pump(self, proc):
+        cap = int(SAMPLE_RATE * 2 * self.MAX_BUFFER_S)
+        while True:
+            b = proc.stdout.read1(65536)
+            if not b:
+                return
+            with self._lock:
+                self._buf += b
+                if len(self._buf) > cap:  # the worker stalled: keep the newest audio, stay in real time
+                    del self._buf[: len(self._buf) - cap]
+
+    def _drain_err(self, proc):
+        for line in proc.stderr:
+            line = line.decode("utf-8", "replace").strip()
+            if '"error"' in line:
+                self.error = line[:300]
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def tick(self, now: float) -> bool:
+        """Respawn a dead helper (with backoff). Returns True when it was restarted this call."""
+        if self.alive() or now < self._next_try:
+            return False
+        self._next_try = now + self.RETRY_S
+        self._refresh_pid()
+        if self.start():
+            self.restarts += 1
+            return True
+        return False
+
+    def read(self, n: int) -> np.ndarray:
+        with self._lock:
+            take = min(len(self._buf), n * 2) // 2 * 2
+            out = bytes(self._buf[:take])
+            del self._buf[:take]
+        a = np.frombuffer(out, dtype=np.int16)
+        return a if len(a) == n else np.concatenate((a, np.zeros(n - len(a), dtype=np.int16)))
+
+    def close(self):
+        p, self.proc = self.proc, None
+        if p is None:
+            return
+        try:
+            if p.stdin:
+                p.stdin.close()
+            p.wait(timeout=2)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
 def run_worker_loop(
     meeting_dir: str,
     synthetic: bool = False,
@@ -494,6 +610,7 @@ def run_worker_loop(
     last_chunk_time = None
 
     cap_proc = None
+    live = None
     mic = None
     mic_final = []  # the last live mic_ok, so the post-close heartbeats do not report a closed mic as dead
     lvl_me = lvl_them = 0.0
@@ -501,21 +618,22 @@ def run_worker_loop(
         src = manifest.get("source") or {}
         mic = MicCapture(_configured_mic_device(src), sd_module=mic_sd)
         mic.start()
-        exe = os.path.join(HERE, "ScribeCapture.exe")
-        if os.path.exists(exe):
-            args = [exe, "--pid", str(src["pid"])] if src.get("kind") == "app" and src.get("pid") else [
-                exe, "--device", str(src.get("device") or "default")
-            ]
+        live = None
+        if finalize:
             try:
-                cap_proc = subprocess.Popen(
-                    args,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0,
-                )
-            except OSError:
-                cap_proc = None
+                import meeting_pipeline as mp  # lazy: meeting_pipeline imports this module
+
+                live = mp.make_live_transcriber(meeting_dir)
+                if live:
+                    live.start()
+            except Exception as e:
+                print(f"[meeting_recorder] live transcription off: {e}")
+                live = None
+        cap_proc = CallCapture(src)
+        if not os.path.exists(cap_proc.exe):
+            cap_proc = None
+        else:
+            cap_proc.start()  # a failed first start is retried by cap_proc.tick in the loop
 
     def _emit_heartbeat(cur_state: str, rms_me: float = 0.0, rms_them: float = 0.0):
         write_status(
@@ -538,6 +656,7 @@ def run_worker_loop(
     last_hb = time.monotonic()
     ctrl_path = os.path.join(meeting_dir, "control.json")
 
+    next_tick = time.monotonic()
     try:
         while True:
             ctrl = _read_json(ctrl_path)
@@ -556,12 +675,9 @@ def run_worker_loop(
                     me_block = mic.read(block_frames) if mic is not None else np.zeros(block_frames, dtype=np.int16)
                     them_block = np.zeros(block_frames, dtype=np.int16)
                 else:
-                    raw = cap_proc.stdout.read(block_frames * 2)
-                    them_block = (
-                        np.frombuffer(raw, dtype=np.int16)
-                        if raw and len(raw) == block_frames * 2
-                        else np.zeros(block_frames, dtype=np.int16)
-                    )
+                    if cap_proc.tick(t_step):
+                        _note_capture_restart(meeting_dir, me_total_frames / float(SAMPLE_RATE), cap_proc)
+                    them_block = cap_proc.read(block_frames)
                     me_block = mic.read(block_frames) if mic is not None else np.zeros(block_frames, dtype=np.int16)
 
                 lvl_me = max(lvl_me, _level(me_block))
@@ -589,23 +705,22 @@ def run_worker_loop(
                 lvl_me = lvl_them = 0.0
                 last_hb = now_m
 
-            elapsed = time.monotonic() - t_step
-            if elapsed < block_s:
-                time.sleep(block_s - elapsed)
+            # fixed schedule, not "sleep block_s after the work": per-step overhead used to add up to
+            # ~0.6% slower than real time; after a long stall, resync instead of bursting to catch up
+            next_tick += block_s
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -1.0:
+                next_tick = time.monotonic()
     finally:
+        if live is not None:
+            live.stop()  # before the "stopped" heartbeat: the app's finalize may start right after it
         if mic is not None:
             mic_final.append(mic.ok)
             mic.close()
         if cap_proc is not None:
-            try:
-                if cap_proc.stdin:
-                    cap_proc.stdin.close()
-                cap_proc.wait(timeout=2)
-            except Exception:
-                try:
-                    cap_proc.kill()
-                except Exception:
-                    pass
+            cap_proc.close()
         if me_frames_in_seg > 0 and me_buf and them_buf:
             seg_idx += 1
             write_flac_segment(meeting_dir, "me", seg_idx, np.concatenate(me_buf), SAMPLE_RATE)

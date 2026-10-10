@@ -27,3 +27,6 @@ meetings/
 
 # Compiled capture helper (build with Build-ScribeCapture.ps1)
 ScribeCapture.exe
+
+# Clipboard history (private, local)
+clipboard.db*

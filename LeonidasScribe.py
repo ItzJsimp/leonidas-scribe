@@ -211,6 +211,15 @@ class LeonidasScribeApp:
         ui_cfg = self.config.get("ui", {})
         motion.set_calm(bool(ui_cfg.get("calm") or ui_cfg.get("reduced_motion")))
 
+        # Copy tab history: a failure here must never break dictation
+        try:
+            from clipboard_history import ClipStore, ClipWatcher
+            self.clip_store = ClipStore(os.path.join(self.base_dir, "clipboard.db"))
+            self.clip_watcher = ClipWatcher(self.clip_store, self.app.clipboard())
+            self.clip_watcher.enabled = bool(self.config.get("clipboard_history", {}).get("enabled", True))
+        except Exception as e:
+            print(f"[LeonidasScribe] Clipboard history init warning: {e}")
+
         # Core Engines
         self.recorder = AudioRecorder(
             sample_rate=self.config.get("audio", {}).get("sample_rate", 16000),

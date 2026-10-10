@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer, QRect, QUrl, QDateTime
+from PySide6.QtCore import Qt, Signal, QTimer, QRect, QUrl, QDateTime, QPoint
 from PySide6.QtGui import QColor, QPainter, QKeySequence, QShortcut, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSlider,
@@ -79,6 +79,35 @@ def fmt_card_date(ts) -> str:
 def fmt_long_date(ts) -> str:
     dt = _local(ts)
     return f"{dt:%b} {dt.day}, {dt.year} {dt.hour % 12 or 12}:{dt:%M} {'AM' if dt.hour < 12 else 'PM'}" if dt else ""
+
+
+def _chan(name) -> str:
+    """'〔🔊〕・Lounge' -> 'Lounge': drop the decoration servers put in front of channel names."""
+    return re.sub(r"^\W+", "", name or "").strip() or (name or "")
+
+
+def discord_hops(m: dict) -> list:
+    """Voice channels this meeting was in, in order: [{guild, channel, t}] (channel switches included)."""
+    hops = [h for h in m.get("discord_channels") or [] if h.get("channel")]
+    d = m.get("discord") or {}
+    return hops or ([dict(d, t=0.0)] if d.get("channel") else [])
+
+
+def fmt_place(m: dict) -> str:
+    """'Friends › Lounge', then '→ General' per switch; '' when no Discord channel is known."""
+    hops = discord_hops(m)
+    if not hops:
+        return ""
+    first = hops[0]
+    out = f"{first.get('guild') or 'Direct Message'} › {_chan(first.get('channel'))}"
+    for prev, h in zip(hops, hops[1:]):
+        out += f"  →  {'' if h.get('guild') == prev.get('guild') else (h.get('guild') or '') + ' › '}{_chan(h.get('channel'))}"
+    return out
+
+
+def fmt_place_tip(m: dict) -> str:
+    return "\n".join(f"{mst.format_timestamp(h.get('t') or 0)}  {h.get('guild') or 'Direct Message'} › {_chan(h.get('channel'))}"
+                     for h in discord_hops(m))
 
 
 def _audio_files(mdir: str) -> list:
@@ -508,8 +537,10 @@ class MeetingCard(QFrame):
         v.setSpacing(8)
         self.lbl_title = ClampLabel(title, 2, "CardTitle")  # one face: mixed line heights broke the card baselines
         v.addWidget(self.lbl_title)
-        v.addWidget(_label(" · ".join(x for x in (fmt_card_date(m.get("started")), fmt_length(m["duration_s"])) if x),
-                           "Meta", "Date and length"))
+        hops = discord_hops(m)
+        where = _chan(hops[-1].get("channel")) if hops else ""
+        v.addWidget(_label(" · ".join(x for x in (fmt_card_date(m.get("started")), fmt_length(m["duration_s"]), where) if x),
+                           "Meta", "Date, length and Discord channel\n" + fmt_place_tip(m) if where else "Date and length"))
 
         foot = QHBoxLayout()
         foot.setSpacing(4)
@@ -635,7 +666,7 @@ class MeetingPlayer(QFrame):
             reason = ""
         elif m.get("audio_deleted_at"):
             reason = f"Audio removed by retention on {fmt_card_date(m['audio_deleted_at'])}. Transcript and note stay."
-        elif m.get("state") in ("recording", "paused", "processing"):
+        elif m.get("state") in ("recording", "paused", "processing") or m.get("audio_pending"):
             reason = "Audio is still being recorded or encoded"
         else:
             reason = "No audio was kept for this meeting"
@@ -1053,15 +1084,22 @@ class SideSheetWidget(QFrame):
         dh.setSpacing(4)
         dh.addWidget(self.cb_dest, 1)
         dh.addWidget(self.btn_fav)
+        self.lbl_where = ElidingLabel("")
+        self.lbl_where.setObjectName("Meta")
         self.cb_tmpl = QComboBox()
         self.cb_tmpl.setToolTip("Note layout. A change applies the next time the note is generated.")
         self.cb_tmpl.activated.connect(self._tmpl_picked)
+        self.where_row = []
         for r, (g, name, w) in enumerate((("calendar", "Date", self.in_date), ("clock", "Length", self.lbl_len),
+                                          ("volume", "Where", self.lbl_where),
                                           ("people", "People", people_w), ("folder", "Saved to", dest_w),
                                           ("library", "Template", self.cb_tmpl))):
-            props.addWidget(_icon_label(g, name), r, 0)
+            lab = _icon_label(g, name)
+            props.addWidget(lab, r, 0)
             props.addWidget(w, r, 1)
             props.setRowMinimumHeight(r, 32)
+            if w is self.lbl_where:
+                self.where_row = [lab, w]
         props.setColumnStretch(1, 1)
         root.addLayout(props)
 
@@ -1101,6 +1139,14 @@ class SideSheetWidget(QFrame):
         self.grip.setGeometry(0, 0, 6, self.height())
         self.grip.raise_()
 
+    def showEvent(self, e):  # every open/close path lands here, so the list reflows once
+        super().showEvent(e)
+        self.view._place_panels()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.view._place_panels()
+
     def load(self, m: dict):
         self._loading = True
         same = self.m.get("dir") == m.get("dir")
@@ -1114,6 +1160,11 @@ class SideSheetWidget(QFrame):
         if dt:
             self.in_date.setDateTime(QDateTime(dt.year, dt.month, dt.day, dt.hour, dt.minute, 0))
         self.lbl_len.setText(fmt_length(m["duration_s"]))
+        place = fmt_place(m)
+        self.lbl_where.setText(place)
+        self.lbl_where.setToolTip("Discord voice channel (updates live when you switch)\n" + fmt_place_tip(m) if place else "")
+        for w in self.where_row:
+            w.setVisible(bool(place))
         _clear(self.people)
         for name in m.get("speakers") or []:
             chip = button(name, "PersonChip", None, f"Rename {name} everywhere in this meeting")
@@ -1575,9 +1626,11 @@ class MeetingsView(QWidget):
     FILTERS = (("all", "All", "Every meeting"), ("pinned", "Pinned", "Meetings whose audio is kept forever"),
                ("notsaved", "Not saved", "Meetings only in Scribe, not yet written to a folder"))
     CARD_MIN = 220
+    CARD_MAX = 340          # cards stop growing here; spare width stays empty instead of stretching them
     SHEET_DEFAULT_W = 520   # was 380-460; the user wanted it a bit wider (2026-10-09)
     SHEET_MIN_W = 380
-    LIST_MIN_W = 420        # rail plus one card column stays clickable beside the sheet
+    SHEET_MAX_W = 760       # past this the player and fields only stretch, so the drag stops
+    LIST_MIN_W = 520        # header (title, search, Import, Record) plus one card column beside the sheet
 
     def __init__(self, host):
         super().__init__()
@@ -1599,6 +1652,7 @@ class MeetingsView(QWidget):
         self._end_host = None
         self._pending_open = None
         self._sheet_w = None  # set by dragging the sheet edge; else config meetings.sheet_width
+        self._reserve = 0     # px of the list under the open sheet, pushed into the right margin
         self._recovery_toasted = set()
 
         outer = QVBoxLayout(self)
@@ -1608,6 +1662,7 @@ class MeetingsView(QWidget):
         lay = QVBoxLayout(content)
         lay.setContentsMargins(24, 20, 24, 24)
         lay.setSpacing(12)
+        self._lay = lay
 
         self.in_search = QLineEdit()
         self.in_search.setPlaceholderText("Search")
@@ -1648,6 +1703,7 @@ class MeetingsView(QWidget):
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
         self.grid.setVerticalSpacing(12)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         lay.addLayout(self.grid)
         self.empty_slot = QVBoxLayout()
         lay.addLayout(self.empty_slot)
@@ -1814,19 +1870,32 @@ class MeetingsView(QWidget):
             card.set_selected(m["dir"] == self.selected)
             self.grid.addWidget(card, i // cols, i % cols)
             self._cards.append(card)
-        for c in range(4):
-            self.grid.setColumnStretch(c, 1 if c < cols else 0)
         self._cols = cols
+        self._size_cards()
+
+    def _list_width(self) -> int:
+        """Width the card grid can use: viewport minus page margins minus whatever the sheet covers."""
+        return max(self.CARD_MIN, self.scroll.viewport().width() - 48 - self._reserve)
 
     def _columns(self) -> int:
-        w = self.width() - 48
-        return max(1, min(4, (w + 12) // (self.CARD_MIN + 12)))
+        return max(1, min(4, (self._list_width() + 12) // (self.CARD_MIN + 12)))
+
+    def _size_cards(self):
+        cols = max(1, self._cols)
+        cw = min(self.CARD_MAX, (self._list_width() - 12 * (cols - 1)) // cols)
+        for c in self._cards:
+            c.setFixedWidth(max(200, cw))
+
+    def _reflow(self):
+        if self._cards and self._columns() != self._cols:
+            self._render()
+        else:
+            self._size_cards()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._place_panels()
-        if self._cards and self._columns() != self._cols:
-            self._render()
+        self._reflow()
 
     def _layer(self) -> QWidget:
         """The window's central widget (falls back to the view): the sheet sits at the window edge
@@ -1848,14 +1917,29 @@ class MeetingsView(QWidget):
         return False
 
     def _place_panels(self):
+        if not hasattr(self, "overlay"):
+            return  # sheet events fire while __init__ is still building the view
         layer = self.sheet.parentWidget() or self
         w, h = layer.width(), layer.height()
+        vp = self.scroll.viewport()
+        if layer is self:
+            left, right = 0, vp.width()
+        else:
+            left = self.mapTo(layer, QPoint(0, 0)).x()
+            right = vp.mapTo(layer, QPoint(vp.width(), 0)).x()
         want = self._sheet_w or int(self._cfg().get("sheet_width") or self.SHEET_DEFAULT_W)
-        sw = max(self.SHEET_MIN_W, min(want, w - self.LIST_MIN_W))  # the list keeps room to click
+        sw = max(self.SHEET_MIN_W, min(want, self.SHEET_MAX_W, w - left - self.LIST_MIN_W))
         self.sheet.setGeometry(w - sw, 0, sw, h)
         self.scrim.setGeometry(0, 0, w, h)
         fw = min(1040, w - 64)
         self.overlay.setGeometry((w - fw) // 2, 24, fw, h - 48)
+        # Docked, not floating: the list gives up the width the sheet covers, so the header and
+        # cards reflow left instead of sliding under it.
+        reserve = max(0, right - (w - sw)) if not self.sheet.isHidden() else 0
+        if reserve != self._reserve:
+            self._reserve = reserve
+            self._lay.setContentsMargins(24, 20, 24 + reserve, 24)
+            self._reflow()
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -2295,10 +2379,15 @@ class MeetingsView(QWidget):
     def start_recording(self, source: dict):
         """Public API for the app shell. source: manifest source {kind, app, pid, device, mic} plus optional
         title, destination_id, template_id, discord {...}, participants [...]."""
+        src = dict(source or {})
+        if src.get("meeting_dir"):  # the meeting service already made the folder and started the worker
+            if self.rec_dir != src["meeting_dir"]:
+                self._adopt(src["meeting_dir"], src.get("title") or "")
+                self.refresh()
+            return
         if self.rec_dir:
             self.host.toast("Already recording. Stop the current meeting first.", "warn")
             return
-        src = dict(source or {})
         now = datetime.datetime.now()
         title = src.pop("title", None) or f"Meeting {now:%b} {now.day}, {now.hour % 12 or 12}:{now:%M} " \
                                                 f"{'AM' if now.hour < 12 else 'PM'}"
@@ -2313,10 +2402,18 @@ class MeetingsView(QWidget):
         def job():
             import meeting_service as msvc  # lazy: it lists audio sessions through ScribeCapture
             source = msvc.prefer_call_audio(src)
-            mr.init_meeting_dir(mdir, title=title, source=source, discord=discord, participants=people,
+            svc = getattr(msvc.MeetingService, "current", None)
+            ch = svc.current_channel() if svc else None
+            mr.init_meeting_dir(mdir, title=title, source=source, discord=discord or msvc.discord_fields(ch),
+                                participants=people or [{"key": p.get("name") or p.get("discord_id"), "name": p.get("name"),
+                                                         "discord_id": p.get("discord_id"), "avatar_path": None}
+                                                        for p in (ch or {}).get("participants") or []] or None,
                                 destination_id=dest, template_id=tmpl)
             _starting(mdir)  # a fresh heartbeat, so the recovery scan never flags a worker still booting
-            return mr.start_worker(mdir)
+            pid = mr.start_worker(mdir)
+            if svc:
+                svc.attach(mdir)  # channel switches mid-call land in this meeting's manifest
+            return pid
 
         def started(_pid):
             self.btn_record.setEnabled(True)
@@ -2359,7 +2456,7 @@ class MeetingsView(QWidget):
         self._show_end_card(mdir, title)
 
         def job():
-            mr.stop_worker(mdir)
+            mr.stop_worker(mdir, timeout=30)  # was 5 s: finalizing early orphaned the last segment
             return finalize_meeting(mdir, me)
         self._async(job, lambda res: self._finished(mdir, title, res), "Could not finish the meeting")
 
@@ -2481,7 +2578,7 @@ class MeetingsView(QWidget):
 
     # ----- side sheet width ----------------------------------------------------
     def set_sheet_width(self, w: int):
-        self._sheet_w = max(self.SHEET_MIN_W, int(w))
+        self._sheet_w = max(self.SHEET_MIN_W, min(self.SHEET_MAX_W, int(w)))
         self._place_panels()
 
     def save_sheet_width(self):

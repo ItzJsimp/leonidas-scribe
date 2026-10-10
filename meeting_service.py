@@ -63,6 +63,35 @@ def prefer_call_audio(src: dict, sessions_fn=None) -> dict:
     return {**src, **ds} if ds else src
 
 
+def discord_fields(ev: dict | None) -> dict | None:
+    """The manifest 'discord' block for an RPC channel event (None when not in a voice channel)."""
+    if not ev or not ev.get("channel_id"):
+        return None
+    return {k: ev.get(k) for k in ("guild_id", "guild", "channel_id", "channel")}
+
+
+def note_channel(mdir: str, ev: dict, t: float) -> None:
+    """Record where the call is: manifest.discord = the current channel, manifest.discord_channels = every
+    switch with its offset in seconds (a None channel means you left voice). New voices join participants."""
+    man = mr.read_manifest(mdir)
+    if not man:
+        return
+    here = discord_fields(ev)
+    hops = man.setdefault("discord_channels", [])
+    if hops and hops[-1].get("channel_id") == (here or {}).get("channel_id"):
+        return
+    hops.append(dict(here or {"channel_id": None, "channel": None, "guild_id": None, "guild": None}, t=round(max(0.0, t), 1)))
+    if here:
+        man["discord"] = dict(man.get("discord") or {}, **here)
+        known = {p.get("discord_id") or p.get("name") for p in man.get("participants") or []}
+        for p in ev.get("participants") or []:
+            if (p.get("discord_id") or p.get("name")) not in known:
+                man.setdefault("participants", []).append(
+                    {"key": p.get("name") or p.get("discord_id"), "name": p.get("name"),
+                     "discord_id": p.get("discord_id"), "avatar_path": None})
+    mr.write_manifest(mdir, man)  # ponytail: read-modify-write; the worker only writes at start and stop
+
+
 def pid_alive(pid) -> bool:
     if not pid:
         return False
@@ -169,6 +198,7 @@ class MeetingService:
                 return
             self.running = True
             self._stop.clear()
+        MeetingService.current = self  # the Meetings view asks the live service for the Discord channel
         self._threads = [self._spawn(self._boot, name="meeting-boot"),
                          self._spawn(self._rpc_loop, name="meeting-rpc"),
                          self._spawn(self._poll_loop, name="meeting-poll")]
@@ -225,10 +255,11 @@ class MeetingService:
         for mdir, m in list(self._iter_meetings()):
             if self._stop.is_set():
                 return
-            if m.get("state") not in ("processing", "needs_key"):
+            stuck_audio = m.get("state") == "ready" and m.get("audio_pending")  # quit or crash mid-Opus
+            if m.get("state") not in ("processing", "needs_key") and not stuck_audio:
                 continue
             st = mr.read_status(mdir) or {}
-            if m.get("state") == "processing" and pid_alive(st.get("pid")):
+            if (m.get("state") == "processing" or stuck_audio) and pid_alive(st.get("pid")):
                 continue  # its own worker is still running the pipeline
             self._finalizing.add(mdir)  # tick() reports the outcome
             self._finalize(mdir)
@@ -293,11 +324,42 @@ class MeetingService:
             if self._log_f:
                 self._log_f.close()
             self._log_f = open(os.path.join(mdir, "speaking.jsonl"), "a", encoding="utf-8")
-            if kind == "discord" and self._channel:
+            if self._channel:
                 self._log_event(self._channel)  # who was already in the room
+                self._note(mdir, self._channel)
         info = dict(manifest.get("source") or {}, meeting_dir=mdir, title=manifest.get("title"))
         self._status("recording", info)
         self._call(self.on_start, info)
+
+    def current_channel(self) -> dict | None:
+        """The voice channel Discord RPC last reported (guild, channel, participants), or None."""
+        ch = self._channel
+        return dict(ch) if ch and ch.get("channel_id") else None
+
+    def attach(self, mdir):
+        """Track a recording the Meetings view started itself (manual Record): channel switches and
+        speaking events land in its manifest. Never spawns a worker or calls on_start."""
+        with self._lock:
+            if self._active:
+                return False
+            m = mr.read_manifest(mdir) or {}
+            self._active = {"dir": mdir, "id": m.get("id") or os.path.basename(mdir), "kind": "manual", "key": None}
+            self._tracker = md.CallLifecycleTracker()
+            self._tracker.on_active(self._active["id"], self._now())
+            self._t0_wall = float(m.get("record_started_wall") or time.time())
+            if self._log_f:
+                self._log_f.close()
+            self._log_f = open(os.path.join(mdir, "speaking.jsonl"), "a", encoding="utf-8")
+            if self._channel:
+                self._log_event(self._channel)
+                self._note(mdir, self._channel)
+        return True
+
+    def _note(self, mdir, ev):
+        try:
+            note_channel(mdir, ev, time.time() - self._t0_wall)
+        except Exception as e:
+            print(f"[MeetingService] channel note failed: {e}")
 
     def stop_recording(self, auto=False):
         """Ask the worker to stop (it finishes segments and the pipeline on its own). Non-blocking."""
@@ -335,7 +397,7 @@ class MeetingService:
     def _ask(self, key, place, dest_id, record_fn, never_fn):
         self._prompted.add(key)
         self._call(self.on_prompt, place, self._destination_name(dest_id),
-                   lambda: self._spawn(record_fn, name="meeting-record"),
+                   lambda dest=None: self._spawn(record_fn, dest, name="meeting-record"),  # the toast passes its folder
                    lambda: self._spawn(never_fn, name="meeting-never"))
 
     def _persist(self, cfg):
@@ -360,8 +422,8 @@ class MeetingService:
         md.apply_never_here(cfg, ev)
         self._persist(cfg)
 
-    def _record_app(self, det):
-        self.start_recording({"kind": "app", "app": det["app"], "pid": det["pid"], "device": None},
+    def _record_app(self, det, dest=None):
+        self.start_recording({"kind": "app", "app": det["app"], "pid": det["pid"], "device": None}, destination_id=dest,
                              title=f"{det['app']} call", kind="app", key=("app", det["process"].lower()))
 
     def _never_app(self, det):
@@ -411,11 +473,14 @@ class MeetingService:
             self._channel = ev if cid else None
             act = self._active
             if not cid:
+                if act:
+                    self._note(act["dir"], ev)
                 self._prompted = {k for k in self._prompted if k[0] != "discord"}
                 if act and act["kind"] == "discord":
                     self._tracker.on_inactive(self._now())
                 return
             if act:
+                self._note(act["dir"], ev)  # switched channels mid-call: same meeting, new place
                 if act["kind"] == "discord":
                     self._tracker.on_active(act["id"], self._now())  # rejoin inside 2 min continues the same meeting
                 return
@@ -424,7 +489,8 @@ class MeetingService:
         if res["should_prompt"] and key not in self._prompted:
             place = (res.get("toast") or {}).get("place") or ev.get("guild") or ev.get("channel") or "Direct Message"
             self._ask(key, place, res.get("destination_id"),
-                      lambda: self._record_discord(ev, res), lambda: self._never_discord(ev))
+                      lambda dest: self._record_discord(ev, dict(res, destination_id=dest or res.get("destination_id"))),
+                      lambda: self._never_discord(ev))
 
     # ------------------------------------------------------------ polling: other apps, auto-stop, recovery, sweep
     def _poll_loop(self):
@@ -459,7 +525,7 @@ class MeetingService:
                 for det in found:
                     key = ("app", det["process"].lower())
                     if key not in self._prompted:
-                        self._ask(key, det["app"], None, lambda d=det: self._record_app(d), lambda d=det: self._never_app(d))
+                        self._ask(key, det["app"], None, lambda dest, d=det: self._record_app(d, dest), lambda d=det: self._never_app(d))
         if act and self._tracker.check(self._now()).get("action") == "auto_stop":
             self.stop_recording(auto=True)
         self._watch_finalizing()

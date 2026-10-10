@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import wave
 
@@ -183,8 +184,13 @@ def interpolate_words(text: str, t0: float, t1: float) -> list[dict]:
 
 def append_chunk_jsonl(meeting_dir: str, chunk_record: dict) -> None:
     path = os.path.join(meeting_dir, "chunks.jsonl")
-    line = json.dumps(chunk_record, ensure_ascii=False) + "\n"
-    with open(path, "a", encoding="utf-8") as f:
+    line = (json.dumps(chunk_record, ensure_ascii=False) + "\n").encode("utf-8")
+    with open(path, "ab+") as f:
+        f.seek(0, 2)
+        if f.tell():
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":  # a kill mid-append left a torn line: never glue the next record onto it
+                line = b"\n" + line
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
@@ -199,7 +205,10 @@ def read_chunks_jsonl(meeting_dir: str) -> list[dict]:
         for line in f:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue  # torn by a kill mid-append: that chunk is simply transcribed again
     return rows
 
 
@@ -421,31 +430,35 @@ def finalize_opus(meeting_dir: str) -> dict:
     audio_dir = os.path.join(meeting_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
     result = {}
-    for track in ("me", "them"):
+
+    def encode(track):  # libsndfile drops the GIL, so the two tracks encode in parallel
         seg_files = mr._segment_files(meeting_dir, track)
         opus_path = os.path.join(audio_dir, f"{track}.opus")
         if not seg_files:
             result[f"{track}_opus"] = opus_path
             result[f"{track}_duration"] = 0.0
-            continue
-        arrays = []
-        expected_frames = 0
-        sr = SAMPLE_RATE
-        for fpath in seg_files:
-            data, file_sr = sf.read(fpath, dtype="float32")
-            sr = file_sr
-            arrays.append(data)
-            expected_frames += len(data)
-        full_audio = np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.float32)
+            return
+        infos = [sf.info(f) for f in seg_files]
+        sr = infos[0].samplerate if infos else SAMPLE_RATE
+        expected_frames = sum(i.frames for i in infos)
+        expected_dur = expected_frames / float(sr)
+        if os.path.exists(opus_path) and os.path.getsize(opus_path) and sf.info(opus_path).duration >= expected_dur - 0.5:
+            # a crash between verify and delete left some FLAC behind: the Opus already holds it all,
+            # re-encoding the leftovers would replace a good file with a truncated one
+            for fpath in seg_files:
+                os.remove(fpath)
+            result[f"{track}_opus"] = opus_path
+            result[f"{track}_duration"] = round(sf.info(opus_path).duration, 3)
+            return
+        # int16, header read-back: float32 + a full decode held several GB on a 2 h call (two tracks at once)
+        full_audio = np.concatenate([sf.read(f, dtype="int16")[0] for f in seg_files])
         tmp_opus = opus_path + ".tmp"
         sf.write(tmp_opus, full_audio, sr, format="OGG", subtype="OPUS")
+        del full_audio
         os.replace(tmp_opus, opus_path)
 
         # Verified read-back before deleting source segments
-        info = sf.info(opus_path)
-        readback, rb_sr = sf.read(opus_path, dtype="float32")
-        expected_dur = expected_frames / float(sr)
-        actual_dur = len(readback) / float(rb_sr)
+        actual_dur = sf.info(opus_path).duration
         if not os.path.exists(opus_path) or os.path.getsize(opus_path) == 0 or abs(actual_dur - expected_dur) > 0.5:
             raise RuntimeError(
                 f"Opus read-back verification failed for {opus_path}: expected {expected_dur:.2f}s, got {actual_dur:.2f}s"
@@ -454,6 +467,11 @@ def finalize_opus(meeting_dir: str) -> dict:
             os.remove(fpath)
         result[f"{track}_opus"] = opus_path
         result[f"{track}_duration"] = round(actual_dur, 3)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(2) as ex:
+        for f in [ex.submit(encode, t) for t in ("me", "them")]:
+            f.result()  # re-raise a failed read-back
     return result
 
 
@@ -595,7 +613,7 @@ def _chat(chain, messages, json_mode: bool = False, timeout: float = 90, post=No
         try:
             r = post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body, timeout=timeout)
             if r.status_code >= 400:
-                last = f"HTTP {r.status_code}"
+                last = f"HTTP {r.status_code} from {model}"
                 continue
             out = r.json()["choices"][0]["message"]["content"] or ""
             if out.strip():
@@ -604,6 +622,33 @@ def _chat(chain, messages, json_mode: bool = False, timeout: float = 90, post=No
         except Exception as e:
             last = e
     raise RuntimeError(f"LLM chain failed: {last}")
+
+
+def _chat_hedged(chain, messages, json_mode: bool = False, hedge_s: float = 20.0, timeout: float = 60, chat=None) -> str:
+    """Try the chain in order, but start the next model early when one is slow: free OpenRouter models
+    swing from 14 s to 90 s on the same 43 min note. The first good reply wins; failures move on at once."""
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+    chat = chat or _chat
+    ex = ThreadPoolExecutor(max(1, len(chain)))
+    pending, nxt, last = set(), 0, None
+    try:
+        while True:
+            if not pending and nxt >= len(chain):
+                raise RuntimeError(f"LLM chain failed: {last}")
+            if nxt < len(chain):
+                pending.add(ex.submit(chat, [chain[nxt]], messages, json_mode, timeout))
+                nxt += 1
+            done, pending = wait(pending, timeout=hedge_s if nxt < len(chain) else None, return_when=FIRST_COMPLETED)
+            for f in done:
+                try:
+                    return f.result()
+                except Exception as e:
+                    last = e
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+GROQ_FREE_TPM = 8000
 
 
 def _json_from_llm(text: str) -> dict:
@@ -653,9 +698,11 @@ def _num(x, default=0.0) -> float:
         return default
 
 
-def generate_note_data(manifest: dict, segments: list[dict], cfg: dict, chat=_chat) -> dict:
+def generate_note_data(manifest: dict, segments: list[dict], cfg: dict, chat=None) -> dict:
     """Groq gpt-oss-120b JSON note following the chosen template's section instructions."""
-    chain = _llm_chain(cfg, note=True)
+    # Groq free tier caps gpt-oss-120b at 8k tokens/min: a ~40 min transcript gets HTTP 413 (meeting
+    # 2026-10-09-2003), so long notes fall through to the free OpenRouter models Ask already uses
+    chain = _llm_chain(cfg, note=True) + free_chain(cfg)
     if not chain:
         raise RuntimeError("no Groq key")
     transcript = "\n".join(
@@ -668,7 +715,10 @@ def generate_note_data(manifest: dict, segments: list[dict], cfg: dict, chat=_ch
         + load_template(manifest.get("template_id"))
         + "\nNever use an em dash."
     )
-    raw = _json_from_llm(chat(chain, [{"role": "system", "content": system}, {"role": "user", "content": transcript}], json_mode=True))
+    if (len(system) + len(transcript)) // 4 + 1500 > GROQ_FREE_TPM:  # Groq would answer 413: go straight to the free models
+        chain = [c for c in chain if "groq.com" not in c[0]] or chain
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": transcript}]
+    raw = _json_from_llm(chat(chain, msgs, json_mode=True) if chat else _chat_hedged(chain, msgs, json_mode=True))
     return {
         "title": str(raw.get("title") or manifest.get("title") or "Meeting"),
         "summary": [str(x) for x in raw.get("summary") or []],
@@ -710,6 +760,96 @@ def _transcribe_missing(meeting_dir: str, stt, sample_rate: int = SAMPLE_RATE) -
                 chunker.push(data[i : i + step])
         chunker.flush()
     return failed[0]
+
+
+def default_stt_fn(cfg: dict, retries: int = 5):
+    """Groq chunk STT with the dictionary vocabulary, or None without a Groq key."""
+    key, backup = groq_keys(cfg)
+    if not key:
+        return None
+    vocab = ", ".join(load_dictionary().get("vocabulary") or [])
+
+    def stt(pcm, t0, t1, track):
+        return transcribe_chunk_groq(pcm, t0, t1, api_key=key, prompt_vocab=vocab, api_key_backup=backup,
+                                     retries=retries)
+    return stt
+
+
+class LiveTranscriber:
+    """Transcribes finished chunks while the call is still going, so Stop only waits for the last one.
+
+    Before (2026-10-09): every chunk went to Groq after Stop, ~114 for a 27 min call, throttled by the
+    free tier's per-minute cap: 4.3 min from Stop to note. Live, a call makes ~4 requests a minute.
+    Chunk boundaries depend only on audio already seen, so finalize's full re-chunk produces the same
+    (track, t0, t1) keys and skips everything done here. Runs inside the recorder worker."""
+
+    TRACKS = ("me", "them")
+
+    def __init__(self, meeting_dir: str, stt, interval: float = 15.0, sample_rate: int = SAMPLE_RATE):
+        self.dir, self.stt, self.interval, self.sr = meeting_dir, stt, interval, sample_rate
+        self.done = {(r.get("track"), round(_num(r.get("t0")), 3), round(_num(r.get("t1")), 3))
+                     for r in read_chunks_jsonl(meeting_dir)}
+        self.fed = {t: 0 for t in self.TRACKS}
+        self.chunkers = {t: MeetingChunker(t, (lambda t0, t1, pcm, t=t: self._on_chunk(t, t0, t1, pcm)), sample_rate)
+                         for t in self.TRACKS}
+        self.calls = self.failed = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._aborted = False
+        self._thread = None
+
+    def _on_chunk(self, track, t0, t1, pcm):
+        if (track, t0, t1) in self.done or self._stop.is_set():
+            return
+        try:
+            self.calls += 1
+            res = self.stt(pcm, t0, t1, track)
+        except Exception:
+            self.failed += 1  # finalize retries it
+            return
+        with self._lock:  # after stop() returns nothing is appended, so finalize never sees a duplicate
+            if self._aborted:
+                return
+            append_chunk_jsonl(self.dir, {"track": track, "t0": t0, "t1": t1, "text": res.get("text", ""),
+                                          "words": res.get("words", [])})
+            self.done.add((track, t0, t1))
+
+    def pass_once(self):
+        step = int(self.sr * 0.1)
+        for track in self.TRACKS:
+            files = mr._segment_files(self.dir, track)
+            for path in files[self.fed[track]:]:
+                if self._stop.is_set():
+                    return
+                data, _sr = sf.read(path, dtype="int16")
+                for i in range(0, len(data), step):
+                    self.chunkers[track].push(data[i : i + step])
+                self.fed[track] += 1
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.pass_once()
+            except Exception as e:  # never take the recorder down; finalize covers anything missed
+                print(f"[LiveTranscriber] pass failed: {e}")
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="meeting-live-stt", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, timeout: float = 2.0):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout)
+        with self._lock:
+            self._aborted = True
+
+
+def make_live_transcriber(meeting_dir: str, cfg: dict | None = None, **kw):
+    # one retry: a chunk that fails live is redone by finalize; long 429 waits here would outlive stop()
+    stt = default_stt_fn(cfg if cfg is not None else load_scribe_config(), retries=1)
+    return LiveTranscriber(meeting_dir, stt, **kw) if stt else None
 
 
 def _load_speaking_events(meeting_dir: str, manifest: dict, store_root: str) -> list[dict]:
@@ -840,14 +980,17 @@ def finalize_meeting(meeting_dir: str, *args, **kwargs) -> dict:
                     os.remove(lock)  # the owner crashed: take over
                 except OSError:
                     pass
+                waited = False  # it died mid-job: do the work, do not report its half-done state
                 continue
             if time.monotonic() > deadline:
                 return {"state": (mr.read_manifest(meeting_dir) or {}).get("state", "processing"), "busy": True}
             waited = True
             time.sleep(0.25)
     try:
-        if waited:  # the other finalizer just finished: report its outcome instead of redoing the work
-            m = mr.read_manifest(meeting_dir) or {}
+        m = mr.read_manifest(meeting_dir) or {}
+        finished = m.get("state") in ("ready", "failed", "needs_key") and not m.get("audio_pending") \
+            and os.path.exists(os.path.join(meeting_dir, "note.json"))
+        if waited and finished:  # the other finalizer just finished: report its outcome instead of redoing it
             return {"state": m.get("state", "failed"), "error": m.get("error"), "joined": True}
         os.write(fd, f"{os.getpid()} {time.time():.0f}".encode())
         return _finalize_meeting_unlocked(meeting_dir, *args, **kwargs)
@@ -883,10 +1026,7 @@ def _finalize_meeting_unlocked(
     try:
         _patch_manifest(meeting_dir, state="processing", error=None)
         if stt_fn is None:
-            vocab = ", ".join(load_dictionary().get("vocabulary") or [])
-
-            def stt_fn(pcm, t0, t1, track):
-                return transcribe_chunk_groq(pcm, t0, t1, api_key=key, prompt_vocab=vocab, api_key_backup=backup)
+            stt_fn = default_stt_fn(cfg)
 
         # 1. chunk + transcribe (resumable: chunks already in chunks.jsonl are skipped)
         failed = _transcribe_missing(meeting_dir, stt_fn)
@@ -929,16 +1069,22 @@ def _finalize_meeting_unlocked(
             paths = mst.save_meeting_to_destination(meeting_dir, dest, note_data=note_data, store_root=store_root)
             _patch_manifest(meeting_dir, note_path=paths["note_path"], transcript_path=paths["transcript_path"])
 
-        # 4. Opus (deletes FLAC only after verified read-back); skipped once segments are gone
-        if mr._segment_files(meeting_dir, "me") or mr._segment_files(meeting_dir, "them"):
-            finalize_opus(meeting_dir)
-
-        # 5. index + cost
+        # 4. index + cost, then ready: the note is readable now
         mst.index_meeting(store_root, meeting_dir)
         rows = read_chunks_jsonl(meeting_dir)
         voiced = {t: sum(_num(r.get("t1")) - _num(r.get("t0")) for r in rows if r.get("track") == t) for t in ("me", "them")}
         tokens = sum(len(s.get("text", "")) for s in segments) // 4 + 1000
         estimate_and_log_call_cost(meeting_dir, voiced["me"], voiced["them"], polish_tokens=tokens)
+
+        # 5. Opus after ready (was before it: ~1 s per minute of call held the note back). FLAC is deleted only
+        # after a verified read-back, so a failure here keeps the audio and is reported, not fatal.
+        if mr._segment_files(meeting_dir, "me") or mr._segment_files(meeting_dir, "them"):
+            _patch_manifest(meeting_dir, state="ready", audio_pending=True)
+            try:
+                finalize_opus(meeting_dir)
+                _patch_manifest(meeting_dir, audio_pending=False)
+            except Exception as e:
+                _patch_manifest(meeting_dir, audio_pending=False, error=f"audio: {e}"[:300])
         _patch_manifest(meeting_dir, state="ready")
         return {"state": "ready", "segments": len(segments)}
     except Exception as e:
