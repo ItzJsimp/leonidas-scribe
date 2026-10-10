@@ -29,6 +29,10 @@ from .styles import T
 
 _calm = False
 
+# Island spring (direction C): per 16 ms frame, ~4% overshoot, settles in ~260 ms. Every Island
+# surface that morphs uses these so the overlays move as one system.
+SPRING_K, SPRING_D = 0.22, 0.56
+
 
 def set_calm(on: bool) -> None:
     global _calm

@@ -93,7 +93,7 @@ class AudioFeedback:
         self._play_wav("error", 350, 100)
 
 
-SPRING_K, SPRING_D = 0.22, 0.56   # per 16 ms frame: ~4% overshoot, settles in ~260 ms
+SPRING_K, SPRING_D = motion.SPRING_K, motion.SPRING_D   # shared Island spring (ui/motion.py)
 NUB_W, NUB_H = 44.0, 6.0          # the resting island the pill grows out of and tucks back into
 FADE_IN_S = 0.18                  # content cross-fade after a state change
 CLOSE_S = 0.30                    # tuck back to the nub, then hide the window
@@ -563,9 +563,9 @@ class FloatingHUDWidget(QWidget):
 
         # black island; at nub height it reads as a quiet obsidian sliver
         nub = max(0.0, min(1.0, (h - NUB_H) / 20.0))
-        o6 = _c("obsidian_600")
-        fill = QColor(int(o6.red() * (1 - nub)), int(o6.green() * (1 - nub)), int(o6.blue() * (1 - nub)),
-                      int((178 + 77 * nub) * body_alpha))
+        o6, isl = _c("obsidian_600"), _c("island")
+        fill = QColor(int(o6.red() + (isl.red() - o6.red()) * nub), int(o6.green() + (isl.green() - o6.green()) * nub),
+                      int(o6.blue() + (isl.blue() - o6.blue()) * nub), int((178 + 77 * nub) * body_alpha))
         painter.fillPath(path, fill)
         painter.setPen(QPen(QColor(255, 255, 255, int(10 * body_alpha)), 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)

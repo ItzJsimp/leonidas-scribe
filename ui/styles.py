@@ -52,6 +52,10 @@ T = {
     "error_soft":    "rgba(255, 77, 109, 0.12)",
     "white":         "#ffffff",  # text on crimson and error fills
 
+    # Island overlays (direction C, 2026-10-09): dictation pill, meetings pill, end card share these
+    "island":        "#000000",
+    "island_ring":   "rgba(255, 255, 255, 0.06)",
+
     # Shape (S2 soft)
     "r_control": "8px",
     "r_card":    "12px",
@@ -283,13 +287,13 @@ QFrame#PlayerBar {
     border-radius: $r_control;
 }
 QFrame#PillIsland, QFrame#PillCapsule {
-    background-color: $obsidian_900;
-    border: 1px solid $obsidian_700;
+    background-color: $island;
+    border: 1px solid $island_ring;
     border-radius: 18px;
 }
 QFrame#PillPanel {
-    background-color: $obsidian_900;
-    border: 1px solid $obsidian_600;
+    background-color: $island;
+    border: 1px solid $island_ring;
     border-radius: $r_panel;
 }
 QFrame#CallPromptToast {
@@ -359,7 +363,7 @@ QPushButton#PlayBtn:hover { border-color: $cyan; }
 QPushButton#PlayBtn:focus { border: 1px solid $cyan; }
 QPushButton#PlayBtn:disabled { background-color: $obsidian_800; }
 QPushButton#PillBtn {
-    background-color: $obsidian_800; border: 1px solid transparent; border-radius: 14px; padding: 0px;
+    background-color: $obsidian_850; border: 1px solid transparent; border-radius: 14px; padding: 0px;
 }
 QPushButton#PillBtn:hover { border-color: $obsidian_600; }
 QPushButton#PillBtn:focus { border: 1px solid $cyan; }
