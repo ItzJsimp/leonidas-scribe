@@ -45,10 +45,17 @@ class GitUpdater:
         return os.path.exists(git_dir)
 
     def _run_git(self, args: list, timeout: float = 15.0) -> subprocess.CompletedProcess:
-        """Run a git command silently without opening console windows on Windows."""
+        """Run a git command silently without opening console windows or prompting for credentials."""
         creationflags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        env = os.environ.copy()
+        # Suppress all terminal and GUI credential prompts (prevents Git Credential Manager popups)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "never"
+        env["GIT_ASKPASS"] = ""
+        # -c credential.interactive=never ensures GCM never prompts even if invoked
+        cmd = ["git", "-c", "credential.interactive=never"] + args
         return subprocess.run(
-            ["git"] + args,
+            cmd,
             cwd=self.repo_dir,
             capture_output=True,
             text=True,
@@ -56,6 +63,7 @@ class GitUpdater:
             encoding="utf-8",
             errors="replace",
             creationflags=creationflags,
+            env=env,
         )
 
     def _get_local_commit(self) -> str:
@@ -98,11 +106,18 @@ class GitUpdater:
                 fetch_res = self._run_git(["fetch", "origin", branch], timeout=20.0)
                 if fetch_res.returncode != 0:
                     err_msg = fetch_res.stderr.strip() or "Failed to reach remote"
+                    is_auth_error = any(
+                        s in err_msg.lower()
+                        for s in ("could not read username", "terminal prompts disabled", "authentication failed", "not found", "unable to get password")
+                    )
+                    status_text = "Remote requires authentication (updates paused)" if is_auth_error else f"Fetch error: {err_msg[:40]}"
+                    self.last_status = status_text
                     return {
                         "ok": False,
                         "error": err_msg,
+                        "auth_error": is_auth_error,
                         "update_available": False,
-                        "status": f"Fetch error: {err_msg[:40]}",
+                        "status": status_text,
                     }
 
                 local_head = self._get_local_commit()
@@ -210,12 +225,24 @@ class GitUpdater:
                 except Exception as e:
                     print(f"[LeonidasScribe Updater] Initial check error: {e}")
 
+            consecutive_failures = 0
             while not self._stop_event.is_set():
-                if self._stop_event.wait(float(self.check_interval_s)):
+                wait_s = float(self.check_interval_s)
+                # If repeated errors or auth failures occur, back off gracefully (up to 15m)
+                if consecutive_failures >= 3:
+                    wait_s = min(900.0, float(self.check_interval_s) * (2 ** (consecutive_failures - 2)))
+
+                if self._stop_event.wait(wait_s):
                     break
+
                 try:
                     self.check_and_apply_update()
+                    if "error" in self.last_status.lower() or "authentication" in self.last_status.lower():
+                        consecutive_failures += 1
+                    else:
+                        consecutive_failures = 0
                 except Exception as e:
+                    consecutive_failures += 1
                     print(f"[LeonidasScribe Updater] Periodic check error: {e}")
 
         self._thread = threading.Thread(target=_worker, daemon=True, name="ScribeAutoUpdaterThread")
